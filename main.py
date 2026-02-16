@@ -1220,7 +1220,7 @@ def _rank_candidates_by_importance(
         params = dict(xgb_params)
     else:
         params = {
-            "n_estimators": 500,
+            "n_estimators": 2000,
             "max_depth": 6,
             "learning_rate": 0.1,
             "subsample": 0.8,
