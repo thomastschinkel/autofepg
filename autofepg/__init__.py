@@ -48,7 +48,7 @@ from autofepg.generators import (
 from autofepg.builder import FeatureCandidateBuilder
 from autofepg.engine import XGBCVEngine
 
-__version__ = "0.1.1"
+__version__ = "0.1.3"
 
 __all__ = [
     # Main API
