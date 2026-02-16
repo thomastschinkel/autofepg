@@ -716,7 +716,7 @@ class FeatureCandidateBuilder:
         return cat_cols, num_cols
 
     def build(self, df: pd.DataFrame, y: pd.Series) -> List[FeatureGenerator]:
-        """Return a list of all candidate feature generators."""
+        """Return a list of all candidate feature generators, ordered by expected impact."""
         if self.cat_cols is None or self.num_cols is None:
             auto_cat, auto_num = self.auto_detect_columns(df)
             if self.cat_cols is None:
@@ -734,33 +734,75 @@ class FeatureCandidateBuilder:
         # Limit pairing columns
         pair_cols = all_cols[:self.max_pair_cols]
 
-        # --- 1) Pairwise combinations of base features ---
+        # =====================================================================
+        # ORDER: Best-performing feature types first, weakest last.
+        # =====================================================================
+
+        # --- 1) TE of base features (single columns) — typically strongest ---
+        for c in all_cols:
+            candidates.append(TargetEncoding(c))
+
+        # --- 2) CE of base features (single columns) — very strong, no target needed ---
+        for c in all_cols:
+            candidates.append(CountEncoding(c))
+
+        # --- 3) TE of pair interactions — powerful high-cardinality encoding ---
+        for a, b in combinations(pair_cols, 2):
+            candidates.append(TargetEncodingOnPair(a, b))
+
+        # --- 4) CE of pair interactions ---
+        for a, b in combinations(pair_cols, 2):
+            candidates.append(CountEncodingOnPair(a, b))
+
+        # --- 5) Frequency encoding ---
+        for c in all_cols:
+            candidates.append(FrequencyEncoding(c))
+
+        # --- 6) TE with auxiliary targets ---
+        for aux_col in self.aux_target_cols:
+            if aux_col in df.columns:
+                for c in all_cols:
+                    candidates.append(TargetEncodingAuxTarget(c, aux_col))
+
+        # --- 7) Arithmetic interactions for numericals ---
+        num_arith = self.num_cols[:min(len(self.num_cols), 15)]
+        for a, b in combinations(num_arith, 2):
+            for op in ["add", "sub", "mul", "div"]:
+                candidates.append(ArithmeticInteraction(a, b, op))
+
+        # --- 8) Pairwise combinations of base features (label-encoded pairs) ---
         for a, b in combinations(pair_cols, 2):
             candidates.append(PairInteraction(a, b))
 
-        # --- 2) TE / CE of base features (on original target) ---
-        for c in all_cols:
-            candidates.append(TargetEncoding(c))
-            candidates.append(CountEncoding(c))
+        # --- 9) TE/CE of digit features ---
+        for c in self.num_cols[:10]:
+            for d in range(min(self.max_digit_positions, 3)):
+                candidates.append(TargetEncodingOnDigit(c, d))
+                candidates.append(CountEncodingOnDigit(c, d))
 
-        # --- 3) TE / CE of pair interactions ---
-        for a, b in combinations(pair_cols, 2):
-            candidates.append(TargetEncodingOnPair(a, b))
-            candidates.append(CountEncodingOnPair(a, b))
+        # --- 10) Combination of digits and base features (digit x cat -> TE) ---
+        for c_num in self.num_cols[:10]:
+            for c_cat in self.cat_cols[:10]:
+                candidates.append(DigitBasePairTE(c_num, 0, c_cat))
 
-        # --- 4) Digit features for numerical columns ---
+        # --- 11) Quantile binning ---
+        for c in self.num_cols:
+            for nb in self.quantile_bins:
+                candidates.append(QuantileBinFeature(c, n_bins=nb))
+
+        # --- 12) Digit features for numerical columns ---
         for c in self.num_cols:
             for d in range(self.max_digit_positions):
                 candidates.append(DigitFeature(c, d))
 
-        # --- 5) Digit interactions WITHIN same feature (pairs, triples) ---
+        # --- 13) Digit interactions WITHIN same feature (pairs, triples) ---
         for c in self.num_cols:
             digit_positions = list(range(min(self.max_digit_positions, 4)))
             for order in range(2, min(self.max_digit_interaction_order + 1, len(digit_positions) + 1)):
                 for combo in combinations(digit_positions, order):
                     candidates.append(DigitInteraction([(c, d) for d in combo]))
 
-        # --- 6) Digit interactions ACROSS features (pairs, triples) ---
+        # --- 14) Digit interactions ACROSS features (pairs, triples) ---
         num_limited = self.num_cols[:min(len(self.num_cols), 10)]
         if len(num_limited) >= 2:
             for col_combo in combinations(num_limited, 2):
@@ -773,47 +815,15 @@ class FeatureCandidateBuilder:
                 for col_combo in combinations(num_limited[:6], 4):
                     candidates.append(DigitInteraction([(c, 0) for c in col_combo]))
 
-        # --- 7) TE/CE of digit features ---
-        for c in self.num_cols[:10]:
-            for d in range(min(self.max_digit_positions, 3)):
-                candidates.append(TargetEncodingOnDigit(c, d))
-                candidates.append(CountEncodingOnDigit(c, d))
-
-        # --- 8) Rounding features ---
+        # --- 15) Rounding features ---
         for c in self.num_cols:
             for dec in self.rounding_decimals:
                 candidates.append(RoundFeature(c, dec))
 
-        # --- 9) Quantile binning ---
-        for c in self.num_cols:
-            for nb in self.quantile_bins:
-                candidates.append(QuantileBinFeature(c, n_bins=nb))
-
-        # --- 10) Num-to-Cat conversion ---
+        # --- 16) Num-to-Cat conversion ---
         for c in self.num_cols:
             candidates.append(NumToCat(c, n_bins=5))
             candidates.append(NumToCat(c, n_bins=10))
-
-        # --- 11) Frequency encoding ---
-        for c in all_cols:
-            candidates.append(FrequencyEncoding(c))
-
-        # --- 12) Arithmetic interactions for numericals ---
-        num_arith = self.num_cols[:min(len(self.num_cols), 15)]
-        for a, b in combinations(num_arith, 2):
-            for op in ["add", "sub", "mul", "div"]:
-                candidates.append(ArithmeticInteraction(a, b, op))
-
-        # --- 13) TE with auxiliary targets ---
-        for aux_col in self.aux_target_cols:
-            if aux_col in df.columns:
-                for c in all_cols:
-                    candidates.append(TargetEncodingAuxTarget(c, aux_col))
-
-        # --- 14) Combination of digits and base features ---
-        for c_num in self.num_cols[:10]:
-            for c_cat in self.cat_cols[:10]:
-                candidates.append(DigitBasePairTE(c_num, 0, c_cat))
 
         print(f"[AutoFE] Total candidates generated: {len(candidates)}")
         return candidates
@@ -1361,4 +1371,3 @@ def select_features(
 # ============================================================================
 # EXAMPLE USAGE
 # ============================================================================
-
