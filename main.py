@@ -5,7 +5,9 @@ AutoFE - Automatic Feature Engineering Library for Kaggle Playground Competition
 A complete, production-ready library that:
 - Auto-detects categorical/numerical columns
 - Generates a comprehensive set of feature engineering ideas
+- Ranks candidates by XGBoost feature importance (gain) before greedy selection
 - Greedily selects features one-by-one based on CV improvement
+- Optional backward feature selection to prune unnecessary features
 - Supports classification and regression
 - Runs XGBoost on GPU if available
 - Respects a time budget
@@ -872,6 +874,7 @@ class FeatureCandidateBuilder:
 
         # =====================================================================
         # ORDER: Best-performing feature types first, weakest last.
+        # GroupStatFeature and GroupDeviationFeature are moved to the very end.
         # =====================================================================
 
         # --- 0) Missing indicator features ---
@@ -887,83 +890,75 @@ class FeatureCandidateBuilder:
         for c in all_cols:
             candidates.append(CountEncoding(c))
 
-        # --- 3) Statistical aggregation features ---
-        for c_num in self.num_cols[:15]:
-            for c_cat in self.cat_cols[:15]:
-                for stat in ["mean", "std", "min", "max", "median"]:
-                    candidates.append(GroupStatFeature(c_num, c_cat, stat))
-                for mode in ["diff", "ratio"]:
-                    candidates.append(GroupDeviationFeature(c_num, c_cat, mode))
-
-        # --- 4) TE of pair interactions ---
+        # --- 3) TE of pair interactions ---
         for a, b in combinations(pair_cols, 2):
             candidates.append(TargetEncodingOnPair(a, b))
 
-        # --- 5) CE of pair interactions ---
+        # --- 4) CE of pair interactions ---
         for a, b in combinations(pair_cols, 2):
             candidates.append(CountEncodingOnPair(a, b))
 
-        # --- 6) Frequency encoding ---
+        # --- 5) Frequency encoding ---
         for c in all_cols:
             candidates.append(FrequencyEncoding(c))
 
-        # --- 7) TE with auxiliary targets ---
+        # --- 6) TE with auxiliary targets ---
         for aux_col in self.aux_target_cols:
             if aux_col in df.columns:
                 for c in all_cols:
                     candidates.append(TargetEncodingAuxTarget(c, aux_col))
 
-        # --- 8) Unary transforms (log, sqrt, square, reciprocal) ---
+        # --- 7) Unary transforms (log, sqrt, square, reciprocal) ---
         for c in self.num_cols:
             for ttype in ["log1p", "sqrt", "square", "reciprocal"]:
                 candidates.append(UnaryTransform(c, ttype))
 
-        # --- 9) Polynomial features ---
+        # --- 8) Polynomial features ---
         num_poly = self.num_cols[:min(len(self.num_cols), 15)]
         for c in num_poly:
             candidates.append(PolynomialFeature(c, poly_type="square"))
         for a, b in combinations(num_poly, 2):
             candidates.append(PolynomialFeature(a, b, poly_type="cross"))
 
-        # --- 10) Arithmetic interactions for numericals ---
+        # --- 9) Arithmetic interactions for numericals ---
         num_arith = self.num_cols[:min(len(self.num_cols), 15)]
         for a, b in combinations(num_arith, 2):
             for op in ["add", "sub", "mul", "div"]:
                 candidates.append(ArithmeticInteraction(a, b, op))
 
-        # --- 11) Pairwise combinations of base features (label-encoded pairs) ---
+        # --- 10) Pairwise combinations of base features (label-encoded pairs) ---
         for a, b in combinations(pair_cols, 2):
             candidates.append(PairInteraction(a, b))
 
-        # --- 12) TE/CE of digit features ---
+        # --- 11) TE/CE of digit features ---
         for c in self.num_cols[:10]:
             for d in range(min(self.max_digit_positions, 3)):
                 candidates.append(TargetEncodingOnDigit(c, d))
                 candidates.append(CountEncodingOnDigit(c, d))
 
-        # --- 13) Combination of digits and base features (digit x cat -> TE) ---
+        # --- 12) Combination of digits and base features (digit x cat -> TE) ---
         for c_num in self.num_cols[:10]:
             for c_cat in self.cat_cols[:10]:
                 candidates.append(DigitBasePairTE(c_num, 0, c_cat))
 
-        # --- 14) Quantile binning ---
+        # --- 13) Quantile binning ---
         for c in self.num_cols:
             for nb in self.quantile_bins:
                 candidates.append(QuantileBinFeature(c, n_bins=nb))
 
-        # --- 15) Digit features for numerical columns ---
+        # --- 14) Digit features for numerical columns ---
         for c in self.num_cols:
             for d in range(self.max_digit_positions):
                 candidates.append(DigitFeature(c, d))
 
-        # --- 16) Digit interactions WITHIN same feature ---
+        # --- 15) Digit interactions WITHIN same feature ---
         for c in self.num_cols:
             digit_positions = list(range(min(self.max_digit_positions, 4)))
             for order in range(2, min(self.max_digit_interaction_order + 1, len(digit_positions) + 1)):
                 for combo in combinations(digit_positions, order):
                     candidates.append(DigitInteraction([(c, d) for d in combo]))
 
-        # --- 17) Digit interactions ACROSS features ---
+        # --- 16) Digit interactions ACROSS features ---
         num_limited = self.num_cols[:min(len(self.num_cols), 10)]
         if len(num_limited) >= 2:
             for col_combo in combinations(num_limited, 2):
@@ -976,15 +971,23 @@ class FeatureCandidateBuilder:
                 for col_combo in combinations(num_limited[:6], 4):
                     candidates.append(DigitInteraction([(c, 0) for c in col_combo]))
 
-        # --- 18) Rounding features ---
+        # --- 17) Rounding features ---
         for c in self.num_cols:
             for dec in self.rounding_decimals:
                 candidates.append(RoundFeature(c, dec))
 
-        # --- 19) Num-to-Cat conversion ---
+        # --- 18) Num-to-Cat conversion ---
         for c in self.num_cols:
             candidates.append(NumToCat(c, n_bins=5))
             candidates.append(NumToCat(c, n_bins=10))
+
+        # --- 19) Statistical aggregation features (GroupStat + GroupDeviation) — LAST ---
+        for c_num in self.num_cols[:15]:
+            for c_cat in self.cat_cols[:15]:
+                for stat in ["mean", "std", "min", "max", "median"]:
+                    candidates.append(GroupStatFeature(c_num, c_cat, stat))
+                for mode in ["diff", "ratio"]:
+                    candidates.append(GroupDeviationFeature(c_num, c_cat, mode))
 
         print(f"[AutoFE] Total candidates generated: {len(candidates)}")
         return candidates
@@ -1148,6 +1151,179 @@ class XGBCVEngine:
 
 
 # ============================================================================
+# FEATURE IMPORTANCE RANKING HELPER
+# ============================================================================
+
+def _rank_candidates_by_importance(
+    candidates: List[FeatureGenerator],
+    X_eval: pd.DataFrame,
+    y_eval: pd.Series,
+    fold_indices: List[Tuple[np.ndarray, np.ndarray]],
+    task: str,
+    use_gpu: bool,
+    random_state: int,
+    xgb_params: Optional[Dict[str, Any]],
+    verbose: bool = True,
+) -> List[FeatureGenerator]:
+    """
+    Generate all candidate features, train an XGBoost on them, extract
+    feature importances (gain), and return candidates sorted from highest
+    to lowest importance.
+
+    Candidates that fail to generate are appended at the end.
+    """
+    if verbose:
+        print("[AutoFE] Generating all candidate features for importance ranking...")
+
+    generated_features: Dict[str, pd.Series] = {}
+    gen_map: Dict[str, FeatureGenerator] = {}
+    failed_generators: List[FeatureGenerator] = []
+
+    for gen in candidates:
+        try:
+            feat_df = gen.fit_transform(X_eval.copy(), y_eval, fold_indices)
+            for col in feat_df.columns:
+                generated_features[col] = feat_df[col].values
+            gen_map[gen.name] = gen
+        except Exception:
+            failed_generators.append(gen)
+
+    if len(generated_features) == 0:
+        if verbose:
+            print("[AutoFE] No candidate features could be generated. Keeping original order.")
+        return candidates
+
+    # Build feature matrix
+    feat_matrix = pd.DataFrame(generated_features, index=X_eval.index)
+
+    if verbose:
+        print(f"[AutoFE] Built feature matrix with {feat_matrix.shape[1]} candidate columns for ranking.")
+        print("[AutoFE] Training XGBoost for feature importance (gain) ranking...")
+
+    # Prepare the matrix (label encode objects, fill NaN)
+    feat_processed = feat_matrix.copy()
+    for c in feat_processed.columns:
+        if feat_processed[c].dtype == "object" or feat_processed[c].dtype.name == "category":
+            le = LabelEncoder()
+            feat_processed[c] = le.fit_transform(feat_processed[c].fillna("__NAN__").astype(str))
+    feat_processed = feat_processed.fillna(-999)
+    for c in feat_processed.columns:
+        if feat_processed[c].dtype not in [np.float64, np.float32, np.int64, np.int32,
+                                           np.int16, np.int8, np.float16, np.uint8]:
+            try:
+                feat_processed[c] = feat_processed[c].astype(float)
+            except Exception:
+                feat_processed[c] = LabelEncoder().fit_transform(feat_processed[c].astype(str))
+
+    # Build XGBoost params
+    if xgb_params is not None:
+        params = dict(xgb_params)
+    else:
+        params = {
+            "n_estimators": 500,
+            "max_depth": 6,
+            "learning_rate": 0.1,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.0,
+            "n_jobs": -1,
+        }
+
+    if use_gpu:
+        params.setdefault("tree_method", "hist")
+        params.setdefault("device", "cuda")
+    else:
+        params.setdefault("tree_method", "hist")
+    params.setdefault("random_state", random_state)
+    params.setdefault("verbosity", 0)
+
+    early_stopping_rounds = params.pop("early_stopping_rounds", 50)
+
+    # Use first fold for quick training
+    tr_idx, va_idx = fold_indices[0]
+    X_tr = feat_processed.iloc[tr_idx]
+    X_va = feat_processed.iloc[va_idx]
+    y_tr = y_eval.iloc[tr_idx]
+    y_va = y_eval.iloc[va_idx]
+
+    if task == "classification":
+        n_classes = y_eval.nunique()
+        if n_classes == 2:
+            model = xgb.XGBClassifier(
+                **params,
+                objective="binary:logistic",
+                eval_metric="logloss",
+                early_stopping_rounds=early_stopping_rounds,
+            )
+        else:
+            model = xgb.XGBClassifier(
+                **params,
+                objective="multi:softprob",
+                num_class=n_classes,
+                eval_metric="mlogloss",
+                early_stopping_rounds=early_stopping_rounds,
+            )
+    else:
+        model = xgb.XGBRegressor(
+            **params,
+            objective="reg:squarederror",
+            eval_metric="rmse",
+            early_stopping_rounds=early_stopping_rounds,
+        )
+
+    model.fit(
+        X_tr, y_tr,
+        eval_set=[(X_va, y_va)],
+        verbose=False,
+    )
+
+    # Extract gain importances
+    importance_dict = model.get_booster().get_score(importance_type="gain")
+
+    # Map xgboost internal feature names (f0, f1, ...) back to column names
+    feature_names = list(feat_processed.columns)
+    booster_feature_names = model.get_booster().feature_names
+    if booster_feature_names is not None:
+        # XGBoost used our column names
+        name_to_gain = {name: importance_dict.get(name, 0.0) for name in feature_names}
+    else:
+        # XGBoost used f0, f1, ...
+        name_to_gain = {}
+        for i, col_name in enumerate(feature_names):
+            fkey = f"f{i}"
+            name_to_gain[col_name] = importance_dict.get(fkey, 0.0)
+
+    del model
+    gc.collect()
+
+    # Sort candidates by gain (descending)
+    # For candidates whose generated feature name matches a column in name_to_gain
+    scored_candidates: List[Tuple[float, int, FeatureGenerator]] = []
+    for idx, gen in enumerate(candidates):
+        if gen in failed_generators:
+            continue
+        gain = name_to_gain.get(gen.name, 0.0)
+        scored_candidates.append((gain, idx, gen))
+
+    # Sort by gain descending, then by original index for ties
+    scored_candidates.sort(key=lambda x: (-x[0], x[1]))
+
+    sorted_candidates = [sc[2] for sc in scored_candidates]
+    # Append failed generators at the end
+    sorted_candidates.extend(failed_generators)
+
+    if verbose:
+        print(f"[AutoFE] Feature importance ranking complete. Top 10 candidates by gain:")
+        for rank, (gain, idx, gen) in enumerate(scored_candidates[:10]):
+            print(f"    {rank + 1}. {gen.name:<60s} gain={gain:.2f}")
+        if len(failed_generators) > 0:
+            print(f"    ({len(failed_generators)} candidates failed to generate and are appended at end)")
+
+    return sorted_candidates
+
+
+# ============================================================================
 # MAIN AUTOFE CLASS
 # ============================================================================
 
@@ -1179,6 +1355,9 @@ class AutoFE:
 
     Configurable improvement threshold:
         autofe = AutoFE(improvement_threshold=0.0001)  # require 0.0001 AUC improvement
+
+    Backward feature selection (after forward selection, try removing features):
+        autofe = AutoFE(backward_selection=True)
     """
 
     def __init__(
@@ -1198,6 +1377,7 @@ class AutoFE:
         xgb_params: Optional[Dict[str, Any]] = None,
         improvement_threshold: float = 1e-7,
         sample: Optional[int] = None,
+        backward_selection: bool = False,
     ):
         self.task = task
         self.n_folds = n_folds
@@ -1214,6 +1394,7 @@ class AutoFE:
         self.xgb_params = xgb_params
         self.improvement_threshold = improvement_threshold
         self.sample = sample
+        self.backward_selection = backward_selection
 
         self.selected_generators_: List[FeatureGenerator] = []
         self.base_score_: float = None
@@ -1243,6 +1424,117 @@ class AutoFE:
                 idx = rng.choice(len(X), size=self.sample, replace=False)
                 return X.iloc[idx].reset_index(drop=True), y.iloc[idx].reset_index(drop=True)
         return X, y
+
+    def _backward_feature_selection(
+        self,
+        X_base_eval: pd.DataFrame,
+        y_eval: pd.Series,
+        fold_indices_eval: List[Tuple[np.ndarray, np.ndarray]],
+        engine: XGBCVEngine,
+        start_time: float,
+    ):
+        """
+        Backward feature selection: try removing each selected feature one by one.
+        If removing a feature improves or maintains the score, remove it permanently.
+        """
+        if len(self.selected_generators_) == 0:
+            self._log("[AutoFE] No selected features to prune in backward selection.")
+            return X_base_eval
+
+        self._log(f"\n[AutoFE] ========== BACKWARD FEATURE SELECTION ==========")
+        self._log(f"[AutoFE] Starting with {len(self.selected_generators_)} selected features.")
+        self._log(f"[AutoFE] Current best score: {self.best_score_:.6f} ± {self.best_score_std_:.6f}")
+
+        # Build current feature matrix with all selected features
+        X_current = X_base_eval.copy()
+        selected_feat_dfs = {}
+        for gen in self.selected_generators_:
+            try:
+                feat_df = gen.fit_transform(X_base_eval.copy(), y_eval, fold_indices_eval)
+                selected_feat_dfs[gen.name] = feat_df
+                X_current = pd.concat([X_current, feat_df], axis=1)
+            except Exception as e:
+                self._log(f"[AutoFE] Warning: could not regenerate {gen.name} during backward selection: {e}")
+
+        # Current score with all features
+        current_score = self.best_score_
+        current_score_std = self.best_score_std_
+
+        improved = True
+        pass_num = 0
+
+        while improved:
+            improved = False
+            pass_num += 1
+            self._log(f"\n[AutoFE] Backward pass {pass_num}, {len(self.selected_generators_)} features remaining.")
+
+            generators_to_remove = []
+
+            for idx, gen in enumerate(self.selected_generators_):
+                # Time budget check
+                if self.time_budget is not None:
+                    elapsed = time.time() - start_time
+                    if elapsed > self.time_budget:
+                        self._log(f"[AutoFE] Time budget exhausted during backward selection. Stopping.")
+                        return X_current
+
+                if gen.name not in selected_feat_dfs:
+                    continue
+
+                # Build feature matrix without this generator
+                cols_to_drop = list(selected_feat_dfs[gen.name].columns)
+                X_trial = X_current.drop(columns=cols_to_drop, errors="ignore")
+
+                try:
+                    trial_mean, trial_std = engine.evaluate(X_trial, y_eval, fold_indices_eval)
+                except Exception as e:
+                    self._log(f"    [{idx + 1}/{len(self.selected_generators_)}] "
+                              f"Error evaluating without {gen.name}: {e}")
+                    continue
+
+                # Check if removing this feature improves or matches the score
+                is_better = _is_improvement(trial_mean, current_score,
+                                            self.metric_direction,
+                                            self.improvement_threshold)
+
+                if is_better:
+                    self._log(
+                        f"    [{idx + 1}/{len(self.selected_generators_)}] "
+                        f"Remove {gen.name:<60s} "
+                        f"score={trial_mean:.6f}±{trial_std:.6f} > "
+                        f"current={current_score:.6f} ✓ REMOVE"
+                    )
+                    generators_to_remove.append(gen)
+                    current_score = trial_mean
+                    current_score_std = trial_std
+                    improved = True
+                else:
+                    self._log(
+                        f"    [{idx + 1}/{len(self.selected_generators_)}] "
+                        f"Remove {gen.name:<60s} "
+                        f"score={trial_mean:.6f}±{trial_std:.6f} ≤ "
+                        f"current={current_score:.6f} ✗ KEEP"
+                    )
+
+            # Actually remove the flagged generators
+            if generators_to_remove:
+                for gen in generators_to_remove:
+                    self.selected_generators_.remove(gen)
+                    if gen.name in selected_feat_dfs:
+                        cols_to_drop = list(selected_feat_dfs[gen.name].columns)
+                        X_current = X_current.drop(columns=cols_to_drop, errors="ignore")
+                        del selected_feat_dfs[gen.name]
+
+                self.best_score_ = current_score
+                self.best_score_std_ = current_score_std
+                self._log(f"[AutoFE] Removed {len(generators_to_remove)} feature(s) in pass {pass_num}. "
+                          f"New best: {self.best_score_:.6f} ± {self.best_score_std_:.6f}")
+
+        self._log(f"[AutoFE] Backward selection complete. "
+                  f"{len(self.selected_generators_)} features remaining.")
+        self._log(f"[AutoFE] Final score after backward: {self.best_score_:.6f} ± {self.best_score_std_:.6f}")
+
+        return X_current
 
     def fit_select(
         self,
@@ -1284,6 +1576,7 @@ class AutoFE:
         use_gpu = _detect_gpu()
         self._log(f"[AutoFE] GPU available: {use_gpu}")
         self._log(f"[AutoFE] Improvement threshold: {self.improvement_threshold}")
+        self._log(f"[AutoFE] Backward selection: {self.backward_selection}")
 
         # Build engine
         engine = XGBCVEngine(
@@ -1312,6 +1605,23 @@ class AutoFE:
             quantile_bins=self.quantile_bins,
         )
         candidates = builder.build(X_train, y)
+
+        # =====================================================================
+        # RANK CANDIDATES BY XGB FEATURE IMPORTANCE (GAIN) BEFORE TESTING
+        # =====================================================================
+        self._log("\n[AutoFE] Ranking candidates by XGBoost feature importance (gain)...")
+        candidates = _rank_candidates_by_importance(
+            candidates=candidates,
+            X_eval=X_eval.copy(),
+            y_eval=y_eval,
+            fold_indices=fold_indices_eval,
+            task=self.task,
+            use_gpu=use_gpu,
+            random_state=self.random_state,
+            xgb_params=self.xgb_params,
+            verbose=self.verbose,
+        )
+        self._log(f"[AutoFE] Candidates reordered by importance. Starting greedy selection.\n")
 
         # Prepare base feature matrix for evaluation
         X_current_eval = X_eval.copy()
@@ -1400,6 +1710,25 @@ class AutoFE:
                     "error": str(e),
                 })
 
+        elapsed_forward = time.time() - start_time
+        self._log(f"\n[AutoFE] ========== FORWARD SELECTION DONE ==========")
+        self._log(f"[AutoFE] Baseline score : {self.base_score_:.6f} ± {self.base_score_std_:.6f}")
+        self._log(f"[AutoFE] Best score     : {self.best_score_:.6f} ± {self.best_score_std_:.6f}")
+        self._log(f"[AutoFE] Features added : {len(self.selected_generators_)}")
+        self._log(f"[AutoFE] Forward time   : {elapsed_forward:.1f}s")
+
+        # =====================================================================
+        # BACKWARD FEATURE SELECTION (optional)
+        # =====================================================================
+        if self.backward_selection:
+            X_current_eval = self._backward_feature_selection(
+                X_base_eval=X_eval,
+                y_eval=y_eval,
+                fold_indices_eval=fold_indices_eval,
+                engine=engine,
+                start_time=start_time,
+            )
+
         elapsed_total = time.time() - start_time
         self._log(f"\n[AutoFE] ========== DONE ==========")
         self._log(f"[AutoFE] Baseline score : {self.base_score_:.6f} ± {self.base_score_std_:.6f}")
@@ -1466,6 +1795,7 @@ def select_features(
     xgb_params: Optional[Dict[str, Any]] = None,
     improvement_threshold: float = 1e-7,
     sample: Optional[int] = None,
+    backward_selection: bool = False,
 ) -> Dict[str, Any]:
     """
     One-liner convenience function for feature selection.
@@ -1509,6 +1839,9 @@ def select_features(
     sample : int, optional
         Number of rows to use for CV evaluation. If None, use all rows.
         The final re-fit always uses all training data.
+    backward_selection : bool
+        If True, run backward feature selection after forward selection
+        to try removing features that don't contribute. Default False.
 
     Returns
     -------
@@ -1536,6 +1869,7 @@ def select_features(
         xgb_params=xgb_params,
         improvement_threshold=improvement_threshold,
         sample=sample,
+        backward_selection=backward_selection,
     )
 
     result = autofe.fit_select(
