@@ -11,6 +11,9 @@ A complete, production-ready library that:
 - Respects a time budget
 - Allows custom XGBoost parameters
 - No target leakage in any feature engineering step
+- Configurable improvement threshold
+- Score variance tracking across folds
+- Sampling support for faster evaluation
 """
 
 import numpy as np
@@ -64,11 +67,12 @@ def _default_metric(task: str):
         return mean_squared_error, "minimize"
 
 
-def _is_improvement(new_score: float, old_score: float, direction: str) -> bool:
+def _is_improvement(new_score: float, old_score: float, direction: str,
+                    threshold: float = 1e-7) -> bool:
     if direction == "maximize":
-        return new_score > old_score + 1e-7
+        return new_score > old_score + threshold
     else:
-        return new_score < old_score - 1e-7
+        return new_score < old_score - threshold
 
 
 # ============================================================================
@@ -84,10 +88,7 @@ class FeatureGenerator:
         - name: a human-readable name
 
     IMPORTANT: All generators that use the target (y) MUST do so in an
-    out-of-fold manner to prevent target leakage. The full-data mapping
-    used at transform time is built from the entire training set AFTER
-    selection is complete, which is acceptable because test data never
-    leaks into training evaluation.
+    out-of-fold manner to prevent target leakage.
     """
 
     def __init__(self, name: str):
@@ -117,19 +118,15 @@ class PairInteraction(FeatureGenerator):
         s = df[self.col_a].astype(str) + "__" + df[self.col_b].astype(str)
         self._le = LabelEncoder()
         vals = self._le.fit_transform(s.fillna("__NAN__"))
+        # Build O(1) lookup dict for transform
+        self._le_dict = {cls: idx for idx, cls in enumerate(self._le.classes_)}
         return pd.DataFrame({self.name: vals}, index=df.index)
 
     def transform(self, df):
         s = df[self.col_a].astype(str) + "__" + df[self.col_b].astype(str)
         s = s.fillna("__NAN__")
-        le_classes = set(self._le.classes_)
-        mapped = []
-        for v in s:
-            if v in le_classes:
-                mapped.append(self._le.transform([v])[0])
-            else:
-                mapped.append(-1)
-        return pd.DataFrame({self.name: mapped}, index=df.index)
+        mapped = s.map(self._le_dict).fillna(-1).astype(int)
+        return pd.DataFrame({self.name: mapped.values}, index=df.index)
 
 
 # ---------------------------------------------------------------------------
@@ -137,18 +134,7 @@ class PairInteraction(FeatureGenerator):
 # ---------------------------------------------------------------------------
 
 class TargetEncoding(FeatureGenerator):
-    """
-    Out-of-fold target encoding for a single column.
-
-    During fit_transform:
-      - For each validation fold, the encoding is computed ONLY from the
-        corresponding training fold. This prevents target leakage.
-      - A full-data mapping is stored for use at test time only.
-
-    During transform (test data):
-      - The full-data mapping is applied. This is safe because the test
-        target is never seen.
-    """
+    """Out-of-fold target encoding for a single column."""
 
     def __init__(self, col: str, smoothing: float = 20.0, suffix: str = ""):
         nm = f"te__{col}" if not suffix else f"te__{col}_{suffix}"
@@ -170,7 +156,6 @@ class TargetEncoding(FeatureGenerator):
                      (stats["count"] + self.smoothing)
             result.iloc[va_idx] = df[self.col].iloc[va_idx].map(smooth)
 
-        # Full mapping for test (uses all training data — no test leakage)
         full_stats = y.groupby(df[self.col]).agg(["mean", "count"])
         self.mapping_ = (full_stats["count"] * full_stats["mean"] + self.smoothing * self.global_mean_) / \
                         (full_stats["count"] + self.smoothing)
@@ -188,7 +173,7 @@ class TargetEncoding(FeatureGenerator):
 # ---------------------------------------------------------------------------
 
 class CountEncoding(FeatureGenerator):
-    """Count encoding for a single column. Does not use target — no leakage."""
+    """Count encoding for a single column."""
 
     def __init__(self, col: str, suffix: str = ""):
         nm = f"ce__{col}" if not suffix else f"ce__{col}_{suffix}"
@@ -207,11 +192,11 @@ class CountEncoding(FeatureGenerator):
 
 
 # ---------------------------------------------------------------------------
-# 4) Digit Extraction from Numerical Features (no target — no leakage)
+# 4) Digit Extraction — VECTORIZED (no target — no leakage)
 # ---------------------------------------------------------------------------
 
 class DigitFeature(FeatureGenerator):
-    """Extract the i-th digit of a numerical feature (from its integer representation)."""
+    """Extract the i-th digit of a numerical feature using vectorized modular arithmetic."""
 
     def __init__(self, col: str, digit_pos: int):
         super().__init__(f"digit__{col}_pos{digit_pos}")
@@ -219,14 +204,9 @@ class DigitFeature(FeatureGenerator):
         self.digit_pos = digit_pos
 
     def _extract(self, series: pd.Series) -> pd.Series:
-        abs_int = series.fillna(0).abs().astype(np.int64).astype(str)
-
-        def get_digit(s, pos):
-            if pos < len(s):
-                return int(s[-(pos + 1)])
-            return 0
-
-        return abs_int.apply(lambda x: get_digit(x, self.digit_pos))
+        abs_int = series.fillna(0).abs().astype(np.int64)
+        divisor = np.int64(10 ** self.digit_pos)
+        return ((abs_int // divisor) % 10).astype(np.int8)
 
     def fit_transform(self, df, y, fold_indices):
         vals = self._extract(df[self.col])
@@ -238,44 +218,36 @@ class DigitFeature(FeatureGenerator):
 
 
 # ---------------------------------------------------------------------------
-# 5) Digit Interaction (no target — no leakage)
+# 5) Digit Interaction — VECTORIZED (no target — no leakage)
 # ---------------------------------------------------------------------------
 
 class DigitInteraction(FeatureGenerator):
-    """
-    Interaction between digits of numerical features.
-    E.g., digit0 of col_a * 10 + digit0 of col_b  (a simple hash).
-    """
+    """Interaction between digits of numerical features using vectorized ops."""
 
     def __init__(self, col_digit_pairs: List[Tuple[str, int]]):
         name_parts = "_".join([f"{c}d{d}" for c, d in col_digit_pairs])
         super().__init__(f"digitint__{name_parts}")
         self.col_digit_pairs = col_digit_pairs
 
-    def _extract_digit(self, series: pd.Series, pos: int) -> pd.Series:
-        abs_int = series.fillna(0).abs().astype(np.int64).astype(str)
+    def _extract_digit(self, series: pd.Series, pos: int) -> np.ndarray:
+        abs_int = series.fillna(0).abs().astype(np.int64).values
+        divisor = np.int64(10 ** pos)
+        return (abs_int // divisor) % 10
 
-        def get_digit(s, p):
-            if p < len(s):
-                return int(s[-(p + 1)])
-            return 0
-
-        return abs_int.apply(lambda x: get_digit(x, pos))
-
-    def _compute(self, df: pd.DataFrame) -> pd.Series:
-        result = pd.Series(np.zeros(len(df), dtype=np.int64), index=df.index)
-        for i, (col, dpos) in enumerate(self.col_digit_pairs):
+    def _compute(self, df: pd.DataFrame) -> np.ndarray:
+        result = np.zeros(len(df), dtype=np.int64)
+        for col, dpos in self.col_digit_pairs:
             digits = self._extract_digit(df[col], dpos)
-            result = result * 10 + digits.values
+            result = result * 10 + digits
         return result
 
     def fit_transform(self, df, y, fold_indices):
         vals = self._compute(df)
-        return pd.DataFrame({self.name: vals.values}, index=df.index)
+        return pd.DataFrame({self.name: vals}, index=df.index)
 
     def transform(self, df):
         vals = self._compute(df)
-        return pd.DataFrame({self.name: vals.values}, index=df.index)
+        return pd.DataFrame({self.name: vals}, index=df.index)
 
 
 # ---------------------------------------------------------------------------
@@ -377,15 +349,7 @@ class NumToCat(FeatureGenerator):
 # ---------------------------------------------------------------------------
 
 class TargetEncodingAuxTarget(FeatureGenerator):
-    """
-    Target-encode a column using a different column as the 'target'.
-
-    The auxiliary target column is a feature column (e.g., 'employment_status'),
-    NOT the actual prediction target. However, since we are encoding one feature
-    using another feature's values, and both are available in train and test,
-    there is no target leakage. We still use OOF encoding for consistency and
-    to prevent overfitting.
-    """
+    """Target-encode a column using a different column as the 'target'."""
 
     def __init__(self, col: str, aux_target_col: str, smoothing: float = 20.0):
         super().__init__(f"te_aux__{col}_by_{aux_target_col}")
@@ -401,7 +365,6 @@ class TargetEncodingAuxTarget(FeatureGenerator):
             return pd.DataFrame({self.name: np.zeros(len(df))}, index=df.index)
 
         aux = df[self.aux_target_col].copy()
-        # If aux is categorical, label-encode it
         if aux.dtype == "object" or aux.dtype.name == "category":
             self._aux_le = LabelEncoder()
             aux = pd.Series(self._aux_le.fit_transform(aux.fillna("__NAN__").astype(str)),
@@ -412,7 +375,6 @@ class TargetEncodingAuxTarget(FeatureGenerator):
         self.global_mean_ = aux.mean()
         result = pd.Series(np.nan, index=df.index, dtype=float)
 
-        # OOF encoding to prevent overfitting
         for tr_idx, va_idx in fold_indices:
             tr_col = df[self.col].iloc[tr_idx]
             tr_aux = aux.iloc[tr_idx]
@@ -494,12 +456,184 @@ class FrequencyEncoding(FeatureGenerator):
         return pd.DataFrame({self.name: vals.values}, index=df.index)
 
 
+# ---------------------------------------------------------------------------
+# 12) Missing Indicator Features (no target — no leakage)
+# ---------------------------------------------------------------------------
+
+class MissingIndicator(FeatureGenerator):
+    """Binary flag for whether a value was originally NaN."""
+
+    def __init__(self, col: str):
+        super().__init__(f"missing__{col}")
+        self.col = col
+
+    def fit_transform(self, df, y, fold_indices):
+        vals = df[self.col].isna().astype(np.int8)
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+    def transform(self, df):
+        vals = df[self.col].isna().astype(np.int8)
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+
+# ---------------------------------------------------------------------------
+# 13) Statistical Aggregation Features (no target — no leakage)
+# ---------------------------------------------------------------------------
+
+class GroupStatFeature(FeatureGenerator):
+    """
+    For a numerical column grouped by a categorical column, compute group-level
+    statistics (mean, std, min, max, median) and per-row deviations.
+    """
+
+    def __init__(self, num_col: str, cat_col: str, stat: str = "mean"):
+        super().__init__(f"grpstat__{num_col}_by_{cat_col}_{stat}")
+        self.num_col = num_col
+        self.cat_col = cat_col
+        self.stat = stat  # 'mean', 'std', 'min', 'max', 'median'
+        self.mapping_ = None
+        self.fill_value_ = None
+
+    def fit_transform(self, df, y, fold_indices):
+        grouped = df.groupby(self.cat_col)[self.num_col]
+        if self.stat == "mean":
+            self.mapping_ = grouped.mean()
+        elif self.stat == "std":
+            self.mapping_ = grouped.std().fillna(0)
+        elif self.stat == "min":
+            self.mapping_ = grouped.min()
+        elif self.stat == "max":
+            self.mapping_ = grouped.max()
+        elif self.stat == "median":
+            self.mapping_ = grouped.median()
+        else:
+            self.mapping_ = grouped.mean()
+
+        self.fill_value_ = df[self.num_col].agg(self.stat) if self.stat != "std" else 0
+        if pd.isna(self.fill_value_):
+            self.fill_value_ = 0
+
+        vals = df[self.cat_col].map(self.mapping_).fillna(self.fill_value_)
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+    def transform(self, df):
+        vals = df[self.cat_col].map(self.mapping_).fillna(self.fill_value_)
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+
+class GroupDeviationFeature(FeatureGenerator):
+    """Value minus group mean (or ratio to group mean) for a numerical column grouped by categorical."""
+
+    def __init__(self, num_col: str, cat_col: str, mode: str = "diff"):
+        super().__init__(f"grpdev__{num_col}_by_{cat_col}_{mode}")
+        self.num_col = num_col
+        self.cat_col = cat_col
+        self.mode = mode  # 'diff' or 'ratio'
+        self.group_mean_ = None
+        self.global_mean_ = None
+
+    def fit_transform(self, df, y, fold_indices):
+        self.group_mean_ = df.groupby(self.cat_col)[self.num_col].mean()
+        self.global_mean_ = df[self.num_col].mean()
+        if pd.isna(self.global_mean_):
+            self.global_mean_ = 0
+
+        grp_vals = df[self.cat_col].map(self.group_mean_).fillna(self.global_mean_)
+        num_vals = df[self.num_col].fillna(self.global_mean_)
+
+        if self.mode == "diff":
+            result = num_vals - grp_vals
+        else:  # ratio
+            result = num_vals / (grp_vals + 1e-8)
+
+        return pd.DataFrame({self.name: result.values}, index=df.index)
+
+    def transform(self, df):
+        grp_vals = df[self.cat_col].map(self.group_mean_).fillna(self.global_mean_)
+        num_vals = df[self.num_col].fillna(self.global_mean_)
+
+        if self.mode == "diff":
+            result = num_vals - grp_vals
+        else:
+            result = num_vals / (grp_vals + 1e-8)
+
+        return pd.DataFrame({self.name: result.values}, index=df.index)
+
+
+# ---------------------------------------------------------------------------
+# 14) Log/Sqrt/Power Transforms (no target — no leakage)
+# ---------------------------------------------------------------------------
+
+class UnaryTransform(FeatureGenerator):
+    """Unary nonlinear transformations: log1p, sqrt, square."""
+
+    def __init__(self, col: str, transform_type: str = "log1p"):
+        super().__init__(f"unary__{col}_{transform_type}")
+        self.col = col
+        self.transform_type = transform_type
+
+    def _apply(self, series: pd.Series) -> pd.Series:
+        vals = series.fillna(0).astype(float)
+        if self.transform_type == "log1p":
+            return np.log1p(np.abs(vals)) * np.sign(vals)
+        elif self.transform_type == "sqrt":
+            return np.sqrt(np.abs(vals)) * np.sign(vals)
+        elif self.transform_type == "square":
+            return vals ** 2
+        elif self.transform_type == "reciprocal":
+            return 1.0 / (vals + 1e-8)
+        else:
+            return vals
+
+    def fit_transform(self, df, y, fold_indices):
+        vals = self._apply(df[self.col])
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+    def transform(self, df):
+        vals = self._apply(df[self.col])
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+
+# ---------------------------------------------------------------------------
+# 15) Polynomial Features (no target — no leakage)
+# ---------------------------------------------------------------------------
+
+class PolynomialFeature(FeatureGenerator):
+    """Second-degree polynomial: a², b², a×b (beyond basic arithmetic)."""
+
+    def __init__(self, col_a: str, col_b: Optional[str] = None, poly_type: str = "square"):
+        if col_b is None:
+            super().__init__(f"poly__{col_a}_{poly_type}")
+        else:
+            super().__init__(f"poly__{col_a}_{poly_type}_{col_b}")
+        self.col_a = col_a
+        self.col_b = col_b
+        self.poly_type = poly_type  # 'square', 'cross'
+
+    def _compute(self, df):
+        a = df[self.col_a].fillna(0).astype(float)
+        if self.poly_type == "square":
+            return a ** 2
+        elif self.poly_type == "cross" and self.col_b is not None:
+            b = df[self.col_b].fillna(0).astype(float)
+            return a * b
+        return a
+
+    def fit_transform(self, df, y, fold_indices):
+        vals = self._compute(df)
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+    def transform(self, df):
+        vals = self._compute(df)
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+
 # ============================================================================
 # COMPOSITE FEATURE GENERATORS (TE/CE on derived columns)
 # ============================================================================
 
 class TargetEncodingOnPair(FeatureGenerator):
-    """Target encoding on a pair interaction (creates the pair internally). OOF — no leakage."""
+    """Target encoding on a pair interaction. OOF — no leakage."""
 
     def __init__(self, col_a: str, col_b: str, smoothing: float = 20.0):
         super().__init__(f"te__pair_{col_a}_x_{col_b}")
@@ -512,19 +646,21 @@ class TargetEncodingOnPair(FeatureGenerator):
         return df[self.col_a].astype(str) + "__" + df[self.col_b].astype(str)
 
     def fit_transform(self, df, y, fold_indices):
-        pair_col = self._make_pair_col(df)
-        tmp_df = df.copy()
-        tmp_df["__pair__"] = pair_col
-        self.te_ = TargetEncoding("__pair__", self.smoothing, suffix=f"pair_{self.col_a}_{self.col_b}")
+        pair_col_name = "__pair__"
+        df[pair_col_name] = self._make_pair_col(df)
+        self.te_ = TargetEncoding(pair_col_name, self.smoothing,
+                                  suffix=f"pair_{self.col_a}_{self.col_b}")
         self.te_.name = self.name
-        result = self.te_.fit_transform(tmp_df, y, fold_indices)
+        result = self.te_.fit_transform(df, y, fold_indices)
+        del df[pair_col_name]
         result.columns = [self.name]
         return result
 
     def transform(self, df):
-        tmp_df = df.copy()
-        tmp_df["__pair__"] = self._make_pair_col(df)
-        result = self.te_.transform(tmp_df)
+        pair_col_name = "__pair__"
+        df[pair_col_name] = self._make_pair_col(df)
+        result = self.te_.transform(df)
+        del df[pair_col_name]
         result.columns = [self.name]
         return result
 
@@ -542,19 +678,20 @@ class CountEncodingOnPair(FeatureGenerator):
         return df[self.col_a].astype(str) + "__" + df[self.col_b].astype(str)
 
     def fit_transform(self, df, y, fold_indices):
-        pair_col = self._make_pair_col(df)
-        tmp_df = df.copy()
-        tmp_df["__pair__"] = pair_col
-        self.ce_ = CountEncoding("__pair__", suffix=f"pair_{self.col_a}_{self.col_b}")
+        pair_col_name = "__pair__"
+        df[pair_col_name] = self._make_pair_col(df)
+        self.ce_ = CountEncoding(pair_col_name, suffix=f"pair_{self.col_a}_{self.col_b}")
         self.ce_.name = self.name
-        result = self.ce_.fit_transform(tmp_df, y, fold_indices)
+        result = self.ce_.fit_transform(df, y, fold_indices)
+        del df[pair_col_name]
         result.columns = [self.name]
         return result
 
     def transform(self, df):
-        tmp_df = df.copy()
-        tmp_df["__pair__"] = self._make_pair_col(df)
-        result = self.ce_.transform(tmp_df)
+        pair_col_name = "__pair__"
+        df[pair_col_name] = self._make_pair_col(df)
+        result = self.ce_.transform(df)
+        del df[pair_col_name]
         result.columns = [self.name]
         return result
 
@@ -575,21 +712,20 @@ class TargetEncodingOnDigit(FeatureGenerator):
         digit_df = self.digit_gen_.fit_transform(df, y, fold_indices)
         digit_col_name = self.digit_gen_.name
 
-        tmp_df = df.copy()
-        tmp_df[digit_col_name] = digit_df[digit_col_name]
-
+        df[digit_col_name] = digit_df[digit_col_name].values
         self.te_ = TargetEncoding(digit_col_name, self.smoothing)
         self.te_.name = self.name
-        result = self.te_.fit_transform(tmp_df, y, fold_indices)
+        result = self.te_.fit_transform(df, y, fold_indices)
+        del df[digit_col_name]
         result.columns = [self.name]
         return result
 
     def transform(self, df):
         digit_df = self.digit_gen_.transform(df)
         digit_col_name = self.digit_gen_.name
-        tmp_df = df.copy()
-        tmp_df[digit_col_name] = digit_df[digit_col_name]
-        result = self.te_.transform(tmp_df)
+        df[digit_col_name] = digit_df[digit_col_name].values
+        result = self.te_.transform(df)
+        del df[digit_col_name]
         result.columns = [self.name]
         return result
 
@@ -609,21 +745,20 @@ class CountEncodingOnDigit(FeatureGenerator):
         digit_df = self.digit_gen_.fit_transform(df, y, fold_indices)
         digit_col_name = self.digit_gen_.name
 
-        tmp_df = df.copy()
-        tmp_df[digit_col_name] = digit_df[digit_col_name]
-
+        df[digit_col_name] = digit_df[digit_col_name].values
         self.ce_ = CountEncoding(digit_col_name)
         self.ce_.name = self.name
-        result = self.ce_.fit_transform(tmp_df, y, fold_indices)
+        result = self.ce_.fit_transform(df, y, fold_indices)
+        del df[digit_col_name]
         result.columns = [self.name]
         return result
 
     def transform(self, df):
         digit_df = self.digit_gen_.transform(df)
         digit_col_name = self.digit_gen_.name
-        tmp_df = df.copy()
-        tmp_df[digit_col_name] = digit_df[digit_col_name]
-        result = self.ce_.transform(tmp_df)
+        df[digit_col_name] = digit_df[digit_col_name].values
+        result = self.ce_.transform(df)
+        del df[digit_col_name]
         result.columns = [self.name]
         return result
 
@@ -648,21 +783,22 @@ class DigitBasePairTE(FeatureGenerator):
         digit_df = self.digit_gen_.fit_transform(df, y, fold_indices)
         digit_vals = digit_df.iloc[:, 0]
 
-        tmp_df = df.copy()
-        tmp_df["__dbc__"] = self._make_pair(df, digit_vals)
-
-        self.te_ = TargetEncoding("__dbc__", self.smoothing)
+        tmp_col_name = "__dbc__"
+        df[tmp_col_name] = self._make_pair(df, digit_vals)
+        self.te_ = TargetEncoding(tmp_col_name, self.smoothing)
         self.te_.name = self.name
-        result = self.te_.fit_transform(tmp_df, y, fold_indices)
+        result = self.te_.fit_transform(df, y, fold_indices)
+        del df[tmp_col_name]
         result.columns = [self.name]
         return result
 
     def transform(self, df):
         digit_df = self.digit_gen_.transform(df)
         digit_vals = digit_df.iloc[:, 0]
-        tmp_df = df.copy()
-        tmp_df["__dbc__"] = self._make_pair(df, digit_vals)
-        result = self.te_.transform(tmp_df)
+        tmp_col_name = "__dbc__"
+        df[tmp_col_name] = self._make_pair(df, digit_vals)
+        result = self.te_.transform(df)
+        del df[tmp_col_name]
         result.columns = [self.name]
         return result
 
@@ -674,7 +810,7 @@ class DigitBasePairTE(FeatureGenerator):
 class FeatureCandidateBuilder:
     """
     Given a dataframe, auto-detect column types and build a list of
-    FeatureGenerator candidates covering all strategies described.
+    FeatureGenerator candidates covering all strategies.
     """
 
     def __init__(
@@ -738,71 +874,96 @@ class FeatureCandidateBuilder:
         # ORDER: Best-performing feature types first, weakest last.
         # =====================================================================
 
+        # --- 0) Missing indicator features ---
+        cols_with_missing = [c for c in all_cols if df[c].isna().any()]
+        for c in cols_with_missing:
+            candidates.append(MissingIndicator(c))
+
         # --- 1) TE of base features (single columns) — typically strongest ---
         for c in all_cols:
             candidates.append(TargetEncoding(c))
 
-        # --- 2) CE of base features (single columns) — very strong, no target needed ---
+        # --- 2) CE of base features (single columns) ---
         for c in all_cols:
             candidates.append(CountEncoding(c))
 
-        # --- 3) TE of pair interactions — powerful high-cardinality encoding ---
+        # --- 3) Statistical aggregation features ---
+        for c_num in self.num_cols[:15]:
+            for c_cat in self.cat_cols[:15]:
+                for stat in ["mean", "std", "min", "max", "median"]:
+                    candidates.append(GroupStatFeature(c_num, c_cat, stat))
+                for mode in ["diff", "ratio"]:
+                    candidates.append(GroupDeviationFeature(c_num, c_cat, mode))
+
+        # --- 4) TE of pair interactions ---
         for a, b in combinations(pair_cols, 2):
             candidates.append(TargetEncodingOnPair(a, b))
 
-        # --- 4) CE of pair interactions ---
+        # --- 5) CE of pair interactions ---
         for a, b in combinations(pair_cols, 2):
             candidates.append(CountEncodingOnPair(a, b))
 
-        # --- 5) Frequency encoding ---
+        # --- 6) Frequency encoding ---
         for c in all_cols:
             candidates.append(FrequencyEncoding(c))
 
-        # --- 6) TE with auxiliary targets ---
+        # --- 7) TE with auxiliary targets ---
         for aux_col in self.aux_target_cols:
             if aux_col in df.columns:
                 for c in all_cols:
                     candidates.append(TargetEncodingAuxTarget(c, aux_col))
 
-        # --- 7) Arithmetic interactions for numericals ---
+        # --- 8) Unary transforms (log, sqrt, square, reciprocal) ---
+        for c in self.num_cols:
+            for ttype in ["log1p", "sqrt", "square", "reciprocal"]:
+                candidates.append(UnaryTransform(c, ttype))
+
+        # --- 9) Polynomial features ---
+        num_poly = self.num_cols[:min(len(self.num_cols), 15)]
+        for c in num_poly:
+            candidates.append(PolynomialFeature(c, poly_type="square"))
+        for a, b in combinations(num_poly, 2):
+            candidates.append(PolynomialFeature(a, b, poly_type="cross"))
+
+        # --- 10) Arithmetic interactions for numericals ---
         num_arith = self.num_cols[:min(len(self.num_cols), 15)]
         for a, b in combinations(num_arith, 2):
             for op in ["add", "sub", "mul", "div"]:
                 candidates.append(ArithmeticInteraction(a, b, op))
 
-        # --- 8) Pairwise combinations of base features (label-encoded pairs) ---
+        # --- 11) Pairwise combinations of base features (label-encoded pairs) ---
         for a, b in combinations(pair_cols, 2):
             candidates.append(PairInteraction(a, b))
 
-        # --- 9) TE/CE of digit features ---
+        # --- 12) TE/CE of digit features ---
         for c in self.num_cols[:10]:
             for d in range(min(self.max_digit_positions, 3)):
                 candidates.append(TargetEncodingOnDigit(c, d))
                 candidates.append(CountEncodingOnDigit(c, d))
 
-        # --- 10) Combination of digits and base features (digit x cat -> TE) ---
+        # --- 13) Combination of digits and base features (digit x cat -> TE) ---
         for c_num in self.num_cols[:10]:
             for c_cat in self.cat_cols[:10]:
                 candidates.append(DigitBasePairTE(c_num, 0, c_cat))
 
-        # --- 11) Quantile binning ---
+        # --- 14) Quantile binning ---
         for c in self.num_cols:
             for nb in self.quantile_bins:
                 candidates.append(QuantileBinFeature(c, n_bins=nb))
 
-        # --- 12) Digit features for numerical columns ---
+        # --- 15) Digit features for numerical columns ---
         for c in self.num_cols:
             for d in range(self.max_digit_positions):
                 candidates.append(DigitFeature(c, d))
 
-        # --- 13) Digit interactions WITHIN same feature (pairs, triples) ---
+        # --- 16) Digit interactions WITHIN same feature ---
         for c in self.num_cols:
             digit_positions = list(range(min(self.max_digit_positions, 4)))
             for order in range(2, min(self.max_digit_interaction_order + 1, len(digit_positions) + 1)):
                 for combo in combinations(digit_positions, order):
                     candidates.append(DigitInteraction([(c, d) for d in combo]))
 
-        # --- 14) Digit interactions ACROSS features (pairs, triples) ---
+        # --- 17) Digit interactions ACROSS features ---
         num_limited = self.num_cols[:min(len(self.num_cols), 10)]
         if len(num_limited) >= 2:
             for col_combo in combinations(num_limited, 2):
@@ -815,12 +976,12 @@ class FeatureCandidateBuilder:
                 for col_combo in combinations(num_limited[:6], 4):
                     candidates.append(DigitInteraction([(c, 0) for c in col_combo]))
 
-        # --- 15) Rounding features ---
+        # --- 18) Rounding features ---
         for c in self.num_cols:
             for dec in self.rounding_decimals:
                 candidates.append(RoundFeature(c, dec))
 
-        # --- 16) Num-to-Cat conversion ---
+        # --- 19) Num-to-Cat conversion ---
         for c in self.num_cols:
             candidates.append(NumToCat(c, n_bins=5))
             candidates.append(NumToCat(c, n_bins=10))
@@ -836,8 +997,7 @@ class FeatureCandidateBuilder:
 class XGBCVEngine:
     """
     Lightweight XGBoost cross-validation engine.
-    Supports custom xgb_params or uses sensible defaults.
-    GPU mode uses tree_method='hist' + device='cuda'.
+    Returns both mean score and std across folds.
     """
 
     def __init__(self, task: str = "classification", n_folds: int = 5,
@@ -848,7 +1008,7 @@ class XGBCVEngine:
         self.n_folds = n_folds
         self.random_state = random_state
         self.use_gpu = use_gpu
-        self.xgb_params = xgb_params  # User-supplied params (or None for defaults)
+        self.xgb_params = xgb_params
 
         if metric_fn is not None:
             self.metric_fn = metric_fn
@@ -867,26 +1027,16 @@ class XGBCVEngine:
         return list(kf.split(X, y))
 
     def _get_params(self) -> Dict[str, Any]:
-        """
-        Build XGBoost parameters.
-        If user supplied xgb_params, use those as base and only fill in
-        missing defaults for GPU/device settings.
-        Otherwise use sensible defaults.
-        """
         if self.xgb_params is not None:
-            # Start from user params
             params = dict(self.xgb_params)
-            # Ensure GPU settings if use_gpu and user didn't specify
             if self.use_gpu:
                 params.setdefault("tree_method", "hist")
                 params.setdefault("device", "cuda")
             else:
                 params.setdefault("tree_method", "hist")
-            # Ensure some essentials
             params.setdefault("random_state", self.random_state)
             params.setdefault("verbosity", 0)
         else:
-            # Default params
             params = {
                 "n_estimators": 500,
                 "max_depth": 6,
@@ -908,12 +1058,12 @@ class XGBCVEngine:
         return params
 
     def evaluate(self, X: pd.DataFrame, y: pd.Series,
-                 fold_indices: List[Tuple[np.ndarray, np.ndarray]]) -> float:
-        """Run K-fold CV and return the mean score."""
+                 fold_indices: List[Tuple[np.ndarray, np.ndarray]]
+                 ) -> Tuple[float, float]:
+        """Run K-fold CV and return (mean_score, std_score)."""
         params = self._get_params()
         scores = []
 
-        # Extract early_stopping_rounds from params if user set it, else default
         early_stopping_rounds = params.pop("early_stopping_rounds", 50)
 
         # Label encode categoricals for xgb
@@ -925,10 +1075,8 @@ class XGBCVEngine:
                 X_processed[c] = le.fit_transform(X_processed[c].fillna("__NAN__").astype(str))
                 label_encoders[c] = le
 
-        # Handle NaN in numericals
         X_processed = X_processed.fillna(-999)
 
-        # Ensure all numeric
         for c in X_processed.columns:
             if X_processed[c].dtype not in [np.float64, np.float32, np.int64, np.int32,
                                             np.int16, np.int8, np.float16, np.uint8]:
@@ -996,7 +1144,7 @@ class XGBCVEngine:
             del model
             gc.collect()
 
-        return np.mean(scores)
+        return float(np.mean(scores)), float(np.std(scores))
 
 
 # ============================================================================
@@ -1023,18 +1171,21 @@ class AutoFE:
                 "n_estimators": 1000,
                 "max_depth": 8,
                 "learning_rate": 0.05,
-                "subsample": 0.7,
-                "colsample_bytree": 0.7,
-                "early_stopping_rounds": 100,
             }
         )
+
+    Sampling for faster evaluation:
+        autofe = AutoFE(sample=10000)  # use 10000 rows for CV evaluation
+
+    Configurable improvement threshold:
+        autofe = AutoFE(improvement_threshold=0.0001)  # require 0.0001 AUC improvement
     """
 
     def __init__(
         self,
         task: str = "auto",
         n_folds: int = 5,
-        time_budget: Optional[float] = None,  # seconds
+        time_budget: Optional[float] = None,
         random_state: int = 42,
         metric_fn=None,
         metric_direction: str = None,
@@ -1045,6 +1196,8 @@ class AutoFE:
         quantile_bins: List[int] = None,
         verbose: bool = True,
         xgb_params: Optional[Dict[str, Any]] = None,
+        improvement_threshold: float = 1e-7,
+        sample: Optional[int] = None,
     ):
         self.task = task
         self.n_folds = n_folds
@@ -1059,15 +1212,37 @@ class AutoFE:
         self.quantile_bins = quantile_bins
         self.verbose = verbose
         self.xgb_params = xgb_params
+        self.improvement_threshold = improvement_threshold
+        self.sample = sample
 
         self.selected_generators_: List[FeatureGenerator] = []
         self.base_score_: float = None
+        self.base_score_std_: float = None
         self.best_score_: float = None
+        self.best_score_std_: float = None
         self.history_: List[Dict[str, Any]] = []
 
     def _log(self, msg):
         if self.verbose:
             print(msg)
+
+    def _sample_data(self, X: pd.DataFrame, y: pd.Series
+                     ) -> Tuple[pd.DataFrame, pd.Series]:
+        """Subsample data if self.sample is set and smaller than len(X)."""
+        if self.sample is not None and self.sample < len(X):
+            rng = np.random.RandomState(self.random_state)
+            if self.task == "classification":
+                # Stratified sampling
+                from sklearn.model_selection import train_test_split
+                _, X_s, _, y_s = train_test_split(
+                    X, y, test_size=self.sample, random_state=self.random_state,
+                    stratify=y
+                )
+                return X_s.reset_index(drop=True), y_s.reset_index(drop=True)
+            else:
+                idx = rng.choice(len(X), size=self.sample, replace=False)
+                return X.iloc[idx].reset_index(drop=True), y.iloc[idx].reset_index(drop=True)
+        return X, y
 
     def fit_select(
         self,
@@ -1099,9 +1274,16 @@ class AutoFE:
             self._target_le = LabelEncoder()
             y = pd.Series(self._target_le.fit_transform(y), index=y.index)
 
+        # Sample data for evaluation
+        X_eval, y_eval = self._sample_data(X_train, y)
+        if self.sample is not None and self.sample < len(X_train):
+            self._log(f"[AutoFE] Using sample of {len(X_eval)} rows for evaluation "
+                      f"(full data: {len(X_train)} rows)")
+
         # GPU check
         use_gpu = _detect_gpu()
         self._log(f"[AutoFE] GPU available: {use_gpu}")
+        self._log(f"[AutoFE] Improvement threshold: {self.improvement_threshold}")
 
         # Build engine
         engine = XGBCVEngine(
@@ -1111,14 +1293,15 @@ class AutoFE:
             xgb_params=self.xgb_params,
         )
 
-        # Determine metric direction if using default
         if self.metric_direction is None:
             self.metric_direction = engine.metric_direction
 
-        # Get fold indices
-        fold_indices = engine.get_fold_indices(X_train, y)
+        # Get fold indices on evaluation data
+        fold_indices_eval = engine.get_fold_indices(X_eval, y_eval)
+        # Also get fold indices on full data for final refit
+        fold_indices_full = engine.get_fold_indices(X_train, y)
 
-        # Build feature candidates
+        # Build feature candidates (using full training data for column detection)
         builder = FeatureCandidateBuilder(
             cat_cols=cat_cols, num_cols=num_cols,
             aux_target_cols=aux_target_cols or [],
@@ -1130,14 +1313,19 @@ class AutoFE:
         )
         candidates = builder.build(X_train, y)
 
-        # Prepare base feature matrix
-        X_current = X_train.copy()
+        # Prepare base feature matrix for evaluation
+        X_current_eval = X_eval.copy()
+        # Also track which generators are selected for full data application
+        X_current_full = X_train.copy()
 
         # Baseline score
         self._log("[AutoFE] Computing baseline score...")
-        self.base_score_ = engine.evaluate(X_current, y, fold_indices)
-        self.best_score_ = self.base_score_
-        self._log(f"[AutoFE] Baseline CV score: {self.base_score_:.6f}")
+        base_mean, base_std = engine.evaluate(X_current_eval, y_eval, fold_indices_eval)
+        self.base_score_ = base_mean
+        self.base_score_std_ = base_std
+        self.best_score_ = base_mean
+        self.best_score_std_ = base_std
+        self._log(f"[AutoFE] Baseline CV score: {base_mean:.6f} ± {base_std:.6f}")
 
         # Greedy forward selection
         self.selected_generators_ = []
@@ -1157,38 +1345,43 @@ class AutoFE:
                 eta = f" | ETA: {remaining:.0f}s"
 
             try:
-                # Generate feature
-                new_feat_df = gen.fit_transform(X_current, y, fold_indices)
+                # Generate feature on evaluation data
+                new_feat_eval = gen.fit_transform(X_current_eval, y_eval, fold_indices_eval)
 
                 # Add to current features
-                X_trial = pd.concat([X_current, new_feat_df], axis=1)
+                X_trial = pd.concat([X_current_eval, new_feat_eval], axis=1)
 
                 # Evaluate
-                trial_score = engine.evaluate(X_trial, y, fold_indices)
+                trial_mean, trial_std = engine.evaluate(X_trial, y_eval, fold_indices_eval)
 
-                improved = _is_improvement(trial_score, self.best_score_,
-                                           self.metric_direction)
+                improved = _is_improvement(trial_mean, self.best_score_,
+                                           self.metric_direction,
+                                           self.improvement_threshold)
 
                 status = "✓ KEEP" if improved else "✗ DROP"
                 self._log(
                     f"[{i + 1}/{total_candidates}] {gen.name:<60s} "
-                    f"score={trial_score:.6f} best={self.best_score_:.6f} "
+                    f"score={trial_mean:.6f}±{trial_std:.6f} "
+                    f"best={self.best_score_:.6f}±{self.best_score_std_:.6f} "
                     f"{status}{eta}"
                 )
 
                 self.history_.append({
                     "step": i + 1,
                     "name": gen.name,
-                    "score": trial_score,
-                    "best_score": self.best_score_,
+                    "score_mean": trial_mean,
+                    "score_std": trial_std,
+                    "best_score_mean": self.best_score_,
+                    "best_score_std": self.best_score_std_,
                     "kept": improved,
                     "elapsed": time.time() - start_time,
                 })
 
                 if improved:
-                    self.best_score_ = trial_score
+                    self.best_score_ = trial_mean
+                    self.best_score_std_ = trial_std
                     self.selected_generators_.append(gen)
-                    X_current = X_trial
+                    X_current_eval = X_trial
                 else:
                     del X_trial
                     gc.collect()
@@ -1198,8 +1391,10 @@ class AutoFE:
                 self.history_.append({
                     "step": i + 1,
                     "name": gen.name,
-                    "score": None,
-                    "best_score": self.best_score_,
+                    "score_mean": None,
+                    "score_std": None,
+                    "best_score_mean": self.best_score_,
+                    "best_score_std": self.best_score_std_,
                     "kept": False,
                     "elapsed": time.time() - start_time,
                     "error": str(e),
@@ -1207,19 +1402,19 @@ class AutoFE:
 
         elapsed_total = time.time() - start_time
         self._log(f"\n[AutoFE] ========== DONE ==========")
-        self._log(f"[AutoFE] Baseline score : {self.base_score_:.6f}")
-        self._log(f"[AutoFE] Best score     : {self.best_score_:.6f}")
+        self._log(f"[AutoFE] Baseline score : {self.base_score_:.6f} ± {self.base_score_std_:.6f}")
+        self._log(f"[AutoFE] Best score     : {self.best_score_:.6f} ± {self.best_score_std_:.6f}")
         self._log(f"[AutoFE] Features added : {len(self.selected_generators_)}")
         self._log(f"[AutoFE] Total time     : {elapsed_total:.1f}s")
         self._log(f"[AutoFE] Selected features:")
         for g in self.selected_generators_:
             self._log(f"    - {g.name}")
 
-        # Build final datasets
-        # Re-fit selected generators on full training data with OOF encoding
+        # Build final datasets: re-fit selected generators on full training data
+        self._log("[AutoFE] Re-fitting selected generators on full training data...")
         X_train_final = X_train.copy()
         for gen in self.selected_generators_:
-            feat_df = gen.fit_transform(X_train_final, y, fold_indices)
+            feat_df = gen.fit_transform(X_train_final, y, fold_indices_full)
             X_train_final = pd.concat([X_train_final, feat_df], axis=1)
 
         if X_test is not None:
@@ -1269,6 +1464,8 @@ def select_features(
     max_pair_cols: int = 20,
     max_digit_positions: int = 4,
     xgb_params: Optional[Dict[str, Any]] = None,
+    improvement_threshold: float = 1e-7,
+    sample: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     One-liner convenience function for feature selection.
@@ -1306,20 +1503,12 @@ def select_features(
     max_digit_positions : int
         Max digit positions to extract.
     xgb_params : dict, optional
-        Custom XGBoost parameters. If None, sensible defaults are used.
-        Example:
-            {
-                "n_estimators": 1000,
-                "max_depth": 8,
-                "learning_rate": 0.05,
-                "subsample": 0.7,
-                "colsample_bytree": 0.7,
-                "reg_alpha": 0.05,
-                "reg_lambda": 1.5,
-                "early_stopping_rounds": 100,
-            }
-        GPU settings (tree_method='hist', device='cuda') are auto-applied
-        when GPU is detected, but can be overridden via this dict.
+        Custom XGBoost parameters.
+    improvement_threshold : float
+        Minimum score improvement to keep a feature. Default 1e-7.
+    sample : int, optional
+        Number of rows to use for CV evaluation. If None, use all rows.
+        The final re-fit always uses all training data.
 
     Returns
     -------
@@ -1329,8 +1518,10 @@ def select_features(
         'autofe': the fitted AutoFE object
         'history': selection history DataFrame
         'selected_features': list of selected feature names
-        'base_score': baseline CV score
-        'best_score': best CV score after selection
+        'base_score': baseline CV score (mean)
+        'base_score_std': baseline CV score std
+        'best_score': best CV score after selection (mean)
+        'best_score_std': best CV score std after selection
     """
     autofe = AutoFE(
         task=task,
@@ -1343,6 +1534,8 @@ def select_features(
         max_digit_positions=max_digit_positions,
         verbose=verbose,
         xgb_params=xgb_params,
+        improvement_threshold=improvement_threshold,
+        sample=sample,
     )
 
     result = autofe.fit_select(
@@ -1356,7 +1549,9 @@ def select_features(
         "history": autofe.get_history(),
         "selected_features": autofe.get_selected_feature_names(),
         "base_score": autofe.base_score_,
+        "base_score_std": autofe.base_score_std_,
         "best_score": autofe.best_score_,
+        "best_score_std": autofe.best_score_std_,
     }
 
     if X_test is not None:
@@ -1366,8 +1561,3 @@ def select_features(
         output["X_train"] = result
 
     return output
-
-
-# ============================================================================
-# EXAMPLE USAGE
-# ============================================================================
