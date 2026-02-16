@@ -33,7 +33,7 @@ AutoFE-PG is a production-ready library that **automatically generates, evaluate
 ### Installation
 
 ```bash
-pip install -e .
+pip install autofepg .
 ```
 
 Or install dependencies directly:
