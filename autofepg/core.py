@@ -6,6 +6,7 @@ using XGBoost cross-validation as the evaluation engine.
 """
 
 import gc
+import os
 import time
 import warnings
 import numpy as np
@@ -62,6 +63,9 @@ class AutoFE:
         Subsample rows for faster CV evaluation.
     backward_selection : bool
         Whether to run backward pruning after forward selection.
+    report_path : str, optional
+        File path for the feature selection report. Defaults to
+        ``'autofepg_report.txt'``.
 
     Attributes
     ----------
@@ -77,31 +81,8 @@ class AutoFE:
         Best CV score standard deviation.
     history_ : list of dict
         Full selection history.
-
-    Examples
-    --------
-    >>> from autofepg import AutoFE
-    >>> autofe = AutoFE(task="classification", time_budget=3600)
-    >>> X_train_new, X_test_new = autofe.fit_select(
-    ...     X_train, y_train, X_test,
-    ...     aux_target_cols=["col_a", "col_b"],
-    ... )
-    >>> print(autofe.get_selected_feature_names())
-
-    Custom XGBoost parameters:
-
-    >>> autofe = AutoFE(
-    ...     task="classification",
-    ...     xgb_params={"n_estimators": 1000, "max_depth": 8, "learning_rate": 0.05},
-    ... )
-
-    Sampling for faster evaluation:
-
-    >>> autofe = AutoFE(sample=10000)
-
-    Backward selection:
-
-    >>> autofe = AutoFE(backward_selection=True)
+    selection_details_ : list of dict
+        Details for each kept feature including incremental improvement.
     """
 
     def __init__(
@@ -122,6 +103,7 @@ class AutoFE:
         improvement_threshold: float = 1e-7,
         sample: Optional[int] = None,
         backward_selection: bool = False,
+        report_path: Optional[str] = None,
     ):
         self.task = task
         self.n_folds = n_folds
@@ -139,6 +121,7 @@ class AutoFE:
         self.improvement_threshold = improvement_threshold
         self.sample = sample
         self.backward_selection = backward_selection
+        self.report_path = report_path or "autofepg_report.txt"
 
         self.selected_generators_: List[FeatureGenerator] = []
         self.base_score_: Optional[float] = None
@@ -146,6 +129,7 @@ class AutoFE:
         self.best_score_: Optional[float] = None
         self.best_score_std_: Optional[float] = None
         self.history_: List[Dict[str, Any]] = []
+        self.selection_details_: List[Dict[str, Any]] = []
 
     def _log(self, msg: str):
         if self.verbose:
@@ -176,6 +160,170 @@ class AutoFE:
                 )
         return X, y
 
+    def _save_report(self, elapsed_total: float):
+        """Save a detailed feature selection report to a text file."""
+        lines = []
+        lines.append("=" * 80)
+        lines.append("AutoFE-PG  —  Feature Selection Report")
+        lines.append("=" * 80)
+        lines.append("")
+
+        # General info
+        lines.append(f"Task              : {self.task}")
+        lines.append(f"CV folds          : {self.n_folds}")
+        lines.append(f"Random state      : {self.random_state}")
+        lines.append(f"Metric direction  : {self.metric_direction}")
+        lines.append(f"Improvement thr.  : {self.improvement_threshold}")
+        lines.append(f"Backward select.  : {self.backward_selection}")
+        if self.sample is not None:
+            lines.append(f"Eval sample size  : {self.sample}")
+        lines.append(f"Total time        : {elapsed_total:.1f}s")
+        lines.append("")
+
+        # Score summary
+        lines.append("-" * 80)
+        lines.append("SCORE SUMMARY")
+        lines.append("-" * 80)
+        lines.append(
+            f"Baseline score    : {self.base_score_:.8f} ± {self.base_score_std_:.8f}"
+        )
+        lines.append(
+            f"Final best score  : {self.best_score_:.8f} ± {self.best_score_std_:.8f}"
+        )
+
+        if self.metric_direction == "maximize":
+            total_improvement = self.best_score_ - self.base_score_
+            pct = (
+                (total_improvement / abs(self.base_score_) * 100)
+                if self.base_score_ != 0
+                else 0.0
+            )
+            lines.append(
+                f"Total improvement : +{total_improvement:.8f}  "
+                f"(+{pct:.4f}%)"
+            )
+        else:
+            total_improvement = self.base_score_ - self.best_score_
+            pct = (
+                (total_improvement / abs(self.base_score_) * 100)
+                if self.base_score_ != 0
+                else 0.0
+            )
+            lines.append(
+                f"Total improvement : -{abs(self.best_score_ - self.base_score_):.8f}  "
+                f"({pct:.4f}% reduction)"
+            )
+
+        lines.append(f"Features added    : {len(self.selected_generators_)}")
+        lines.append("")
+
+        # Selected features detail
+        lines.append("-" * 80)
+        lines.append("SELECTED FEATURES  (in order of selection)")
+        lines.append("-" * 80)
+        lines.append("")
+
+        if self.metric_direction == "maximize":
+            header = (
+                f"{'#':<5s} {'Feature Name':<60s} {'Score':<18s} "
+                f"{'Improvement':<18s} {'Cumulative':<18s} {'Time (s)':<10s}"
+            )
+        else:
+            header = (
+                f"{'#':<5s} {'Feature Name':<60s} {'Score':<18s} "
+                f"{'Improvement':<18s} {'Cumulative':<18s} {'Time (s)':<10s}"
+            )
+        lines.append(header)
+        lines.append("-" * len(header))
+
+        for i, detail in enumerate(self.selection_details_):
+            name = detail["name"]
+            score_mean = detail["score_mean"]
+            score_std = detail["score_std"]
+            improvement = detail["improvement"]
+            cumulative = detail["cumulative_improvement"]
+            elapsed = detail["elapsed"]
+
+            if self.metric_direction == "maximize":
+                imp_str = f"+{improvement:.8f}"
+                cum_str = f"+{cumulative:.8f}"
+            else:
+                imp_str = f"-{abs(improvement):.8f}"
+                cum_str = f"-{abs(cumulative):.8f}"
+
+            line = (
+                f"{i + 1:<5d} {name:<60s} "
+                f"{score_mean:.6f}±{score_std:.6f} "
+                f"{imp_str:<18s} {cum_str:<18s} {elapsed:<10.1f}"
+            )
+            lines.append(line)
+
+        lines.append("")
+
+        # Removed features (backward selection)
+        removed_in_backward = [
+            d for d in self.selection_details_ if d.get("removed_backward", False)
+        ]
+        if removed_in_backward:
+            lines.append("-" * 80)
+            lines.append("FEATURES REMOVED IN BACKWARD SELECTION")
+            lines.append("-" * 80)
+            lines.append("")
+            for d in removed_in_backward:
+                lines.append(
+                    f"  - {d['name']:<60s} (score without: {d.get('removal_score', 'N/A')})"
+                )
+            lines.append("")
+
+        # Full candidate evaluation log
+        lines.append("-" * 80)
+        lines.append("FULL CANDIDATE EVALUATION LOG")
+        lines.append("-" * 80)
+        lines.append("")
+
+        log_header = (
+            f"{'Step':<6s} {'Kept':<6s} {'Feature Name':<60s} "
+            f"{'Score':<18s} {'Best at time':<18s} {'Time (s)':<10s}"
+        )
+        lines.append(log_header)
+        lines.append("-" * len(log_header))
+
+        for entry in self.history_:
+            step = entry["step"]
+            name = entry["name"]
+            kept = "YES" if entry["kept"] else "no"
+            elapsed = entry.get("elapsed", 0)
+
+            if entry.get("score_mean") is not None:
+                score_str = f"{entry['score_mean']:.6f}±{entry['score_std']:.6f}"
+            elif entry.get("error"):
+                score_str = f"ERROR: {entry['error'][:30]}"
+            else:
+                score_str = "N/A"
+
+            best_str = (
+                f"{entry['best_score_mean']:.6f}±{entry['best_score_std']:.6f}"
+            )
+
+            line = (
+                f"{step:<6d} {kept:<6s} {name:<60s} "
+                f"{score_str:<18s} {best_str:<18s} {elapsed:<10.1f}"
+            )
+            lines.append(line)
+
+        lines.append("")
+        lines.append("=" * 80)
+        lines.append("END OF REPORT")
+        lines.append("=" * 80)
+
+        report_text = "\n".join(lines)
+
+        # Write to file
+        with open(self.report_path, "w", encoding="utf-8") as f:
+            f.write(report_text)
+
+        self._log(f"[AutoFE-PG] Report saved to: {os.path.abspath(self.report_path)}")
+
     def _backward_feature_selection(
         self,
         X_base_eval: pd.DataFrame,
@@ -186,12 +334,15 @@ class AutoFE:
     ):
         """Try removing each selected feature; drop those that don't help."""
         if len(self.selected_generators_) == 0:
-            self._log("[AutoFE-PG] No selected features to prune in backward selection.")
+            self._log(
+                "[AutoFE-PG] No selected features to prune in backward selection."
+            )
             return X_base_eval
 
         self._log(f"\n[AutoFE-PG] ========== BACKWARD FEATURE SELECTION ==========")
         self._log(
-            f"[AutoFE-PG] Starting with {len(self.selected_generators_)} selected features."
+            f"[AutoFE-PG] Starting with {len(self.selected_generators_)} "
+            f"selected features."
         )
         self._log(
             f"[AutoFE-PG] Current best score: "
@@ -272,6 +423,11 @@ class AutoFE:
                         f"current={current_score:.6f} ✓ REMOVE"
                     )
                     generators_to_remove.append(gen)
+                    # Track removal in selection_details
+                    for detail in self.selection_details_:
+                        if detail["name"] == gen.name:
+                            detail["removed_backward"] = True
+                            detail["removal_score"] = trial_mean
                     current_score = trial_mean
                     current_score_std = trial_std
                     improved = True
@@ -292,6 +448,13 @@ class AutoFE:
                             columns=cols_to_drop, errors="ignore"
                         )
                         del selected_feat_dfs[gen.name]
+
+                # Remove from selection_details_ as well
+                self.selection_details_ = [
+                    d
+                    for d in self.selection_details_
+                    if not d.get("removed_backward", False)
+                ]
 
                 self.best_score_ = current_score
                 self.best_score_std_ = current_score_std
@@ -371,6 +534,7 @@ class AutoFE:
         self._log(f"[AutoFE-PG] GPU available: {use_gpu}")
         self._log(f"[AutoFE-PG] Improvement threshold: {self.improvement_threshold}")
         self._log(f"[AutoFE-PG] Backward selection: {self.backward_selection}")
+        self._log(f"[AutoFE-PG] Report will be saved to: {self.report_path}")
 
         # Build engine
         engine = XGBCVEngine(
@@ -418,10 +582,13 @@ class AutoFE:
         self.base_score_std_ = base_std
         self.best_score_ = base_mean
         self.best_score_std_ = base_std
-        self._log(f"[AutoFE-PG] Baseline CV score: {base_mean:.6f} ± {base_std:.6f}")
+        self._log(
+            f"[AutoFE-PG] Baseline CV score: {base_mean:.6f} ± {base_std:.6f}"
+        )
 
         # Greedy forward selection
         self.selected_generators_ = []
+        self.selection_details_ = []
         total_candidates = len(candidates)
 
         for i, gen in enumerate(candidates):
@@ -447,6 +614,7 @@ class AutoFE:
                     X_trial, y_eval, fold_indices_eval
                 )
 
+                score_before = self.best_score_
                 improved = is_improvement(
                     trial_mean,
                     self.best_score_,
@@ -476,6 +644,27 @@ class AutoFE:
                 )
 
                 if improved:
+                    if self.metric_direction == "maximize":
+                        incremental = trial_mean - score_before
+                        cumulative = trial_mean - self.base_score_
+                    else:
+                        incremental = score_before - trial_mean
+                        cumulative = self.base_score_ - trial_mean
+
+                    self.selection_details_.append(
+                        {
+                            "name": gen.name,
+                            "score_mean": trial_mean,
+                            "score_std": trial_std,
+                            "score_before": score_before,
+                            "improvement": incremental,
+                            "cumulative_improvement": cumulative,
+                            "elapsed": time.time() - start_time,
+                            "selection_order": len(self.selected_generators_) + 1,
+                            "removed_backward": False,
+                        }
+                    )
+
                     self.best_score_ = trial_mean
                     self.best_score_std_ = trial_std
                     self.selected_generators_.append(gen)
@@ -542,6 +731,9 @@ class AutoFE:
         for g in self.selected_generators_:
             self._log(f"    - {g.name}")
 
+        # Save the report
+        self._save_report(elapsed_total)
+
         # Re-fit on full training data
         self._log(
             "[AutoFE-PG] Re-fitting selected generators on full training data..."
@@ -587,6 +779,10 @@ class AutoFE:
         """Return selection history as a DataFrame."""
         return pd.DataFrame(self.history_)
 
+    def get_selection_details(self) -> pd.DataFrame:
+        """Return details of selected features including improvements."""
+        return pd.DataFrame(self.selection_details_)
+
 
 # ============================================================================
 # CONVENIENCE FUNCTION
@@ -613,6 +809,7 @@ def select_features(
     improvement_threshold: float = 1e-7,
     sample: Optional[int] = None,
     backward_selection: bool = False,
+    report_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One-liner convenience function for automatic feature engineering.
 
@@ -656,13 +853,16 @@ def select_features(
         Subsample rows for faster CV evaluation.
     backward_selection : bool
         Run backward feature selection after forward selection.
+    report_path : str, optional
+        Path for the feature selection report file.
 
     Returns
     -------
     dict
         Keys: ``'X_train'``, ``'X_test'`` (if provided), ``'autofe'``,
-        ``'history'``, ``'selected_features'``, ``'base_score'``,
-        ``'base_score_std'``, ``'best_score'``, ``'best_score_std'``.
+        ``'history'``, ``'selected_features'``, ``'selection_details'``,
+        ``'base_score'``, ``'base_score_std'``, ``'best_score'``,
+        ``'best_score_std'``.
     """
     autofe = AutoFE(
         task=task,
@@ -678,6 +878,7 @@ def select_features(
         improvement_threshold=improvement_threshold,
         sample=sample,
         backward_selection=backward_selection,
+        report_path=report_path,
     )
 
     result = autofe.fit_select(
@@ -693,6 +894,7 @@ def select_features(
         "autofe": autofe,
         "history": autofe.get_history(),
         "selected_features": autofe.get_selected_feature_names(),
+        "selection_details": autofe.get_selection_details(),
         "base_score": autofe.base_score_,
         "base_score_std": autofe.base_score_std_,
         "best_score": autofe.best_score_,
