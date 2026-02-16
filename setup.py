@@ -22,9 +22,9 @@ setup(
     python_requires=">=3.8",
     author="AutoFE-PG Contributors",
     description="AutoFE - Playground: Automatic Feature Engineering & Selection for Kaggle Playground Competitions",
-    long_description=open("README.md").read(),
+    long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/autofepg",
+    url="https://github.com/thomastschinkel/autofepg",
     license="MIT",
     classifiers=[
         "Development Status :: 4 - Beta",
