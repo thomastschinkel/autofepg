@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autofepg"
-version = "0.1.1"
+version = "0.1.3"
 description = "AutoFE - Playground: Automatic Feature Engineering & Selection for Kaggle Playground Competitions"
 readme = "README.md"
 license = {text = "MIT"}
