@@ -4,7 +4,7 @@
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/yourusername/autofepg/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/autofepg/actions/workflows/ci.yml)
+[![CI](https://github.com/thomastschinkel/autofepg/actions/workflows/ci.yml/badge.svg)](https://github.com/thomastschinkel/autofepg/actions/workflows/ci.yml)
 
 AutoFE-PG is a production-ready library that **automatically generates, evaluates, and selects** engineered features to boost your tabular ML models — with zero target leakage.
 
