@@ -2,16 +2,16 @@
 Feature generators for AutoFE-PG.
 
 Each generator produces one or more columns and implements:
-    - ``fit_transform(df, y, fold_indices)`` → pd.DataFrame (train features)
-    - ``transform(df)`` → pd.DataFrame (test features)
+- fit_transform(df, y, fold_indices) → pd.DataFrame (train features)
+- transform(df) → pd.DataFrame (test features)
 
-All generators that use the target ``y`` do so in an out-of-fold manner
+All generators that use the target y do so in an out-of-fold manner
 to prevent target leakage.
 """
 
 import numpy as np
 import pandas as pd
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from sklearn.preprocessing import LabelEncoder
 
@@ -19,8 +19,6 @@ from sklearn.preprocessing import LabelEncoder
 # ============================================================================
 # BASE CLASS
 # ============================================================================
-
-
 class FeatureGenerator:
     """Abstract base class for feature generators.
 
@@ -76,8 +74,6 @@ class FeatureGenerator:
 # ============================================================================
 # PAIR INTERACTION
 # ============================================================================
-
-
 class PairInteraction(FeatureGenerator):
     """Create a label-encoded interaction feature between two columns.
 
@@ -112,8 +108,6 @@ class PairInteraction(FeatureGenerator):
 # ============================================================================
 # TARGET ENCODING (OUT-OF-FOLD)
 # ============================================================================
-
-
 class TargetEncoding(FeatureGenerator):
     """Out-of-fold target encoding for a single column.
 
@@ -167,8 +161,6 @@ class TargetEncoding(FeatureGenerator):
 # ============================================================================
 # COUNT ENCODING
 # ============================================================================
-
-
 class CountEncoding(FeatureGenerator):
     """Count encoding for a single column.
 
@@ -199,8 +191,6 @@ class CountEncoding(FeatureGenerator):
 # ============================================================================
 # DIGIT EXTRACTION
 # ============================================================================
-
-
 class DigitFeature(FeatureGenerator):
     """Extract the i-th digit of a numerical feature using vectorized modular arithmetic.
 
@@ -234,8 +224,6 @@ class DigitFeature(FeatureGenerator):
 # ============================================================================
 # DIGIT INTERACTION
 # ============================================================================
-
-
 class DigitInteraction(FeatureGenerator):
     """Interaction between digits of numerical features using vectorized ops.
 
@@ -274,8 +262,6 @@ class DigitInteraction(FeatureGenerator):
 # ============================================================================
 # ROUNDING
 # ============================================================================
-
-
 class RoundFeature(FeatureGenerator):
     """Round a numerical feature to a given number of decimals or magnitude.
 
@@ -304,8 +290,6 @@ class RoundFeature(FeatureGenerator):
 # ============================================================================
 # QUANTILE BINNING
 # ============================================================================
-
-
 class QuantileBinFeature(FeatureGenerator):
     """Bin a numerical column into quantile bins.
 
@@ -352,8 +336,6 @@ class QuantileBinFeature(FeatureGenerator):
 # ============================================================================
 # NUM TO CAT
 # ============================================================================
-
-
 class NumToCat(FeatureGenerator):
     """Convert a numerical column into a categorical one via equal-width binning.
 
@@ -402,8 +384,6 @@ class NumToCat(FeatureGenerator):
 # ============================================================================
 # TARGET ENCODING WITH AUXILIARY TARGET
 # ============================================================================
-
-
 class TargetEncodingAuxTarget(FeatureGenerator):
     """Target-encode a column using a different column as the 'target'.
 
@@ -474,8 +454,6 @@ class TargetEncodingAuxTarget(FeatureGenerator):
 # ============================================================================
 # ARITHMETIC INTERACTIONS
 # ============================================================================
-
-
 class ArithmeticInteraction(FeatureGenerator):
     """Sum, difference, product, or ratio between two numerical columns.
 
@@ -520,8 +498,6 @@ class ArithmeticInteraction(FeatureGenerator):
 # ============================================================================
 # FREQUENCY ENCODING
 # ============================================================================
-
-
 class FrequencyEncoding(FeatureGenerator):
     """Frequency (normalized count) encoding for a column.
 
@@ -550,8 +526,6 @@ class FrequencyEncoding(FeatureGenerator):
 # ============================================================================
 # MISSING INDICATOR
 # ============================================================================
-
-
 class MissingIndicator(FeatureGenerator):
     """Binary flag for whether a value was originally NaN.
 
@@ -577,8 +551,6 @@ class MissingIndicator(FeatureGenerator):
 # ============================================================================
 # GROUP STATISTICS
 # ============================================================================
-
-
 class GroupStatFeature(FeatureGenerator):
     """Group-level statistics for a numerical column grouped by a categorical column.
 
@@ -681,8 +653,6 @@ class GroupDeviationFeature(FeatureGenerator):
 # ============================================================================
 # UNARY TRANSFORMS
 # ============================================================================
-
-
 class UnaryTransform(FeatureGenerator):
     """Unary nonlinear transformations: log1p, sqrt, square, reciprocal.
 
@@ -723,8 +693,6 @@ class UnaryTransform(FeatureGenerator):
 # ============================================================================
 # POLYNOMIAL FEATURES
 # ============================================================================
-
-
 class PolynomialFeature(FeatureGenerator):
     """Second-degree polynomial features: square or cross product.
 
@@ -773,8 +741,6 @@ class PolynomialFeature(FeatureGenerator):
 # ============================================================================
 # COMPOSITE: TE/CE ON PAIRS
 # ============================================================================
-
-
 class TargetEncodingOnPair(FeatureGenerator):
     """Target encoding on a pair interaction. OOF — no leakage.
 
@@ -863,8 +829,6 @@ class CountEncodingOnPair(FeatureGenerator):
 # ============================================================================
 # COMPOSITE: TE/CE ON DIGITS
 # ============================================================================
-
-
 class TargetEncodingOnDigit(FeatureGenerator):
     """Target encoding on a digit feature. OOF — no leakage.
 
@@ -953,8 +917,6 @@ class CountEncodingOnDigit(FeatureGenerator):
 # ============================================================================
 # COMPOSITE: DIGIT x CATEGORY TE
 # ============================================================================
-
-
 class DigitBasePairTE(FeatureGenerator):
     """Interaction of a digit of a numerical column with a categorical column, then TE.
 
@@ -1013,3 +975,243 @@ class DigitBasePairTE(FeatureGenerator):
         del df[tmp_col_name]
         result.columns = [self.name]
         return result
+
+
+# ============================================================================
+# DOMAIN ALIGNMENT (DE-NOISING) — Snap synthetic values to nearest real value
+# ============================================================================
+class DomainAlignmentFeature(FeatureGenerator):
+    """Snap each value to its nearest neighbor in a reference (original) dataset.
+
+    Forces synthetic "fuzzy" continuous values back onto the real clinical grid.
+    The snapped value replaces the original for downstream modelling and the
+    residual (distance to nearest real value) is exposed as an extra signal.
+
+    Parameters
+    ----------
+    col : str
+        Numerical column to align.
+    reference_values : array-like
+        Sorted unique values from the original (real) dataset for this column.
+    include_residual : bool
+        If True, also emit a ``_residual`` column (signed distance to snap point).
+    """
+
+    def __init__(
+        self,
+        col: str,
+        reference_values: np.ndarray,
+        include_residual: bool = True,
+    ):
+        super().__init__(f"align__{col}")
+        self.col = col
+        self.reference_values = np.sort(np.asarray(reference_values, dtype=float))
+        self.include_residual = include_residual
+        self.fill_median_: Optional[float] = None
+
+    def _snap(self, series: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (snapped_values, residuals)."""
+        vals = series.fillna(self.fill_median_ if self.fill_median_ is not None else 0).values.astype(float)
+        idx = np.searchsorted(self.reference_values, vals, side="left")
+        idx = np.clip(idx, 1, len(self.reference_values) - 1)
+
+        left = self.reference_values[idx - 1]
+        right = self.reference_values[idx]
+
+        snapped = np.where(np.abs(vals - left) <= np.abs(vals - right), left, right)
+        residuals = vals - snapped
+        return snapped, residuals
+
+    def fit_transform(self, df, y, fold_indices):
+        self.fill_median_ = df[self.col].median()
+        snapped, residuals = self._snap(df[self.col])
+        out = {self.name: snapped}
+        if self.include_residual:
+            out[f"{self.name}_residual"] = residuals
+        return pd.DataFrame(out, index=df.index)
+
+    def transform(self, df):
+        snapped, residuals = self._snap(df[self.col])
+        out = {self.name: snapped}
+        if self.include_residual:
+            out[f"{self.name}_residual"] = residuals
+        return pd.DataFrame(out, index=df.index)
+
+
+# ============================================================================
+# BAYESIAN-STYLE PRIORS (EXTERNAL MAPPING)
+# ============================================================================
+class BayesianPriorFeature(FeatureGenerator):
+    """Inject an external prior probability of the target for each value.
+
+    Given a pre-computed mapping ``{value: P(target | value)}`` derived from an
+    external (original) dataset, each row receives its historical probability
+    as a feature.  This gives the model a "hint" without using the training
+    target — zero leakage.
+
+    Parameters
+    ----------
+    col : str
+        Column whose values are looked up.
+    prior_map : dict
+        Mapping ``{value: prior_probability}``.
+    global_prior : float, optional
+        Fallback value for unseen keys. If None, uses the mean of the map.
+    """
+
+    def __init__(
+        self,
+        col: str,
+        prior_map: Dict,
+        global_prior: Optional[float] = None,
+    ):
+        super().__init__(f"prior__{col}")
+        self.col = col
+        self.prior_map = prior_map
+        self.global_prior = (
+            global_prior
+            if global_prior is not None
+            else float(np.mean(list(prior_map.values()))) if prior_map else 0.0
+        )
+
+    def fit_transform(self, df, y, fold_indices):
+        vals = df[self.col].map(self.prior_map).fillna(self.global_prior)
+        return pd.DataFrame({self.name: vals.values.astype(float)}, index=df.index)
+
+    def transform(self, df):
+        vals = df[self.col].map(self.prior_map).fillna(self.global_prior)
+        return pd.DataFrame({self.name: vals.values.astype(float)}, index=df.index)
+
+
+# ============================================================================
+# DIMENSIONALITY EXPANSION (DUAL REPRESENTATION)
+# ============================================================================
+class DualRepresentationFeature(FeatureGenerator):
+    """Emit both a continuous and a categorical (label-encoded) copy of a column.
+
+    The continuous copy preserves linear / threshold trends while the
+    categorical copy lets tree models create very specific, non-linear splits
+    on exact values.
+
+    Parameters
+    ----------
+    col : str
+        Column to duplicate.
+    """
+
+    def __init__(self, col: str):
+        super().__init__(f"dual__{col}")
+        self.col = col
+        self._le_dict: Optional[Dict] = None
+
+    def fit_transform(self, df, y, fold_indices):
+        continuous = df[self.col].fillna(0).astype(float)
+        cat_key = df[self.col].fillna("__NAN__").astype(str)
+        le = LabelEncoder()
+        categorical = le.fit_transform(cat_key)
+        self._le_dict = {cls: idx for idx, cls in enumerate(le.classes_)}
+        return pd.DataFrame(
+            {
+                f"{self.name}_cont": continuous.values,
+                f"{self.name}_cat": categorical,
+            },
+            index=df.index,
+        )
+
+    def transform(self, df):
+        continuous = df[self.col].fillna(0).astype(float)
+        cat_key = df[self.col].fillna("__NAN__").astype(str)
+        categorical = cat_key.map(self._le_dict).fillna(-1).astype(int)
+        return pd.DataFrame(
+            {
+                f"{self.name}_cont": continuous.values,
+                f"{self.name}_cat": categorical.values,
+            },
+            index=df.index,
+        )
+
+
+# ============================================================================
+# CROSS-DATASET FREQUENCY / DENSITY ANALYSIS
+# ============================================================================
+class CrossDatasetFrequencyFeature(FeatureGenerator):
+    """Measure how common a value is across train, test, and original datasets.
+
+    Computes per-value frequency across the combined ecosystem and flags
+    outliers / over-represented synthetic modes.
+
+    Parameters
+    ----------
+    col : str
+        Column to analyse.
+    ecosystem_counts : pd.Series
+        Pre-computed ``value_counts()`` from the combined
+        (train + test + original) data for this column.
+    ecosystem_total : int
+        Total row count of the combined ecosystem.
+    """
+
+    def __init__(
+        self,
+        col: str,
+        ecosystem_counts: pd.Series,
+        ecosystem_total: int,
+    ):
+        super().__init__(f"xfreq__{col}")
+        self.col = col
+        self.ecosystem_freq = (ecosystem_counts / ecosystem_total).astype(float)
+        self.ecosystem_total = ecosystem_total
+
+    def fit_transform(self, df, y, fold_indices):
+        freq_vals = df[self.col].map(self.ecosystem_freq).fillna(0.0)
+        return pd.DataFrame({self.name: freq_vals.values}, index=df.index)
+
+    def transform(self, df):
+        freq_vals = df[self.col].map(self.ecosystem_freq).fillna(0.0)
+        return pd.DataFrame({self.name: freq_vals.values}, index=df.index)
+
+
+class ValueRarityFeature(FeatureGenerator):
+    """Flag how rare a value is across the data ecosystem.
+
+    Produces a log-inverse-frequency score (higher = rarer). Useful for
+    synthetic datasets where certain modes are over-represented.
+
+    Parameters
+    ----------
+    col : str
+        Column to analyse.
+    ecosystem_counts : pd.Series
+        Pre-computed ``value_counts()`` from the combined data.
+    ecosystem_total : int
+        Total row count of the combined ecosystem.
+    """
+
+    def __init__(
+        self,
+        col: str,
+        ecosystem_counts: pd.Series,
+        ecosystem_total: int,
+    ):
+        super().__init__(f"rarity__{col}")
+        self.col = col
+        self.ecosystem_freq = (ecosystem_counts / ecosystem_total).astype(float)
+        self.max_rarity = float(np.log1p(ecosystem_total))
+
+    def _compute(self, series: pd.Series) -> np.ndarray:
+        freq = series.map(self.ecosystem_freq).fillna(0.0).values.astype(float)
+        # log-inverse-frequency; clip to avoid log(0)
+        rarity = np.where(
+            freq > 0,
+            np.log1p(1.0 / freq),
+            self.max_rarity,
+        )
+        return rarity
+
+    def fit_transform(self, df, y, fold_indices):
+        vals = self._compute(df[self.col])
+        return pd.DataFrame({self.name: vals}, index=df.index)
+
+    def transform(self, df):
+        vals = self._compute(df[self.col])
+        return pd.DataFrame({self.name: vals}, index=df.index)
