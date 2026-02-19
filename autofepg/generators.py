@@ -1215,3 +1215,325 @@ class ValueRarityFeature(FeatureGenerator):
     def transform(self, df):
         vals = self._compute(df[self.col])
         return pd.DataFrame({self.name: vals}, index=df.index)
+
+
+# ============================================================================
+# EXTERNAL DATASET TARGET STATISTICS
+# ============================================================================
+class ExternalTargetStatFeature(FeatureGenerator):
+    """Look up pre-computed target distribution statistics from an external dataset.
+
+    Given a mapping from each value of a column to a dictionary of statistics
+    (e.g. median, std, skew, count) derived from the original (real) dataset's
+    target variable, this generator emits those statistics as separate numeric
+    columns for each row.
+
+    This provides the model with a calibrated "prior shape" — not just the mean
+    probability but the uncertainty, skewness, and support of the target within
+    each group, all derived from an external source with zero leakage.
+
+    Parameters
+    ----------
+    col : str
+        Column whose values are used for the lookup.
+    stat_map : dict
+        Mapping ``{value: {"median": float, "std": float, "skew": float,
+        "count": int, ...}}``. Each value maps to a sub-dict of
+        statistic-name → float.
+    global_fallback : dict, optional
+        Fallback statistics for unseen values. If None, defaults are computed
+        from the stat_map: median of medians, 0 for std/skew, minimum count.
+    """
+
+    def __init__(
+        self,
+        col: str,
+        stat_map: Dict,
+        global_fallback: Optional[Dict[str, float]] = None,
+    ):
+        super().__init__(f"extstat__{col}")
+        self.col = col
+        self.stat_map = stat_map
+
+        # Determine the set of statistics from the first entry
+        if stat_map:
+            first_key = next(iter(stat_map))
+            self.stat_names = sorted(stat_map[first_key].keys())
+        else:
+            self.stat_names = []
+
+        # Build global fallback
+        if global_fallback is not None:
+            self.global_fallback = global_fallback
+        else:
+            self.global_fallback = self._compute_default_fallback()
+
+    def _compute_default_fallback(self) -> Dict[str, float]:
+        """Derive sensible default fallback values from the stat_map."""
+        if not self.stat_map or not self.stat_names:
+            return {}
+
+        fallback = {}
+        for stat in self.stat_names:
+            values = [
+                v[stat] for v in self.stat_map.values()
+                if stat in v and v[stat] is not None and not np.isnan(v[stat])
+            ]
+            if not values:
+                fallback[stat] = 0.0
+                continue
+
+            if stat in ("median", "mean"):
+                fallback[stat] = float(np.median(values))
+            elif stat in ("std", "skew"):
+                fallback[stat] = 0.0
+            elif stat == "count":
+                fallback[stat] = float(min(values))
+            else:
+                fallback[stat] = float(np.median(values))
+
+        return fallback
+
+    def _lookup(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Look up statistics for each row."""
+        out = {}
+        for stat in self.stat_names:
+            col_name = f"extstat__{self.col}__{stat}"
+            fb = self.global_fallback.get(stat, 0.0)
+            mapping = {k: v.get(stat, fb) for k, v in self.stat_map.items()}
+            out[col_name] = df[self.col].map(mapping).fillna(fb).astype(float)
+        return pd.DataFrame(out, index=df.index)
+
+    def fit_transform(self, df, y, fold_indices):
+        return self._lookup(df)
+
+    def transform(self, df):
+        return self._lookup(df)
+
+
+# ============================================================================
+# OOF TARGET AGGREGATION WITH MULTIPLE STATISTICS
+# ============================================================================
+class OOFTargetAggFeature(FeatureGenerator):
+    """Out-of-fold target aggregation with multiple statistics per group.
+
+    Like target encoding, but emits not just the smoothed mean but also
+    additional statistics of the raw target values per group: standard
+    deviation, count, min, and max. All statistics are computed out-of-fold
+    to prevent target leakage.
+
+    The mean statistic uses smoothing toward the global mean for
+    regularization. Other statistics (std, count, min, max) are computed
+    directly from the fold's training portion without smoothing.
+
+    Parameters
+    ----------
+    col : str
+        Column to group by.
+    stats : list of str, optional
+        Statistics to compute. Default: ``["mean", "std", "count"]``.
+        Supported: ``"mean"``, ``"std"``, ``"count"``, ``"min"``, ``"max"``.
+    smoothing : float
+        Smoothing factor applied to the mean statistic only.
+    """
+
+    def __init__(
+        self,
+        col: str,
+        stats: Optional[List[str]] = None,
+        smoothing: float = 20.0,
+    ):
+        super().__init__(f"oof_agg__{col}")
+        self.col = col
+        self.stats = stats or ["mean", "std", "count"]
+        self.smoothing = smoothing
+        self.global_mean_: Optional[float] = None
+        self.global_std_: Optional[float] = None
+        self.global_count_: Optional[float] = None
+        self.global_min_: Optional[float] = None
+        self.global_max_: Optional[float] = None
+        self.mappings_: Optional[Dict[str, pd.Series]] = None
+
+    def _col_name(self, stat: str) -> str:
+        return f"oof_agg__{self.col}__{stat}"
+
+    def _compute_fold_stats(
+        self, group_col: pd.Series, target: pd.Series
+    ) -> Dict[str, pd.Series]:
+        """Compute per-group statistics from a single fold's training data."""
+        grouped = target.groupby(group_col)
+        result = {}
+
+        if "mean" in self.stats:
+            agg = grouped.agg(["mean", "count"])
+            smoothed = (
+                agg["count"] * agg["mean"] + self.smoothing * self.global_mean_
+            ) / (agg["count"] + self.smoothing)
+            result["mean"] = smoothed
+
+        if "std" in self.stats:
+            result["std"] = grouped.std().fillna(0.0)
+
+        if "count" in self.stats:
+            result["count"] = grouped.count().astype(float)
+
+        if "min" in self.stats:
+            result["min"] = grouped.min()
+
+        if "max" in self.stats:
+            result["max"] = grouped.max()
+
+        return result
+
+    def _get_fill_value(self, stat: str) -> float:
+        """Return the neutral fill value for a given statistic."""
+        if stat == "mean":
+            return self.global_mean_ if self.global_mean_ is not None else 0.5
+        elif stat == "std":
+            return 0.0
+        elif stat == "count":
+            return 1.0
+        elif stat == "min":
+            return self.global_min_ if self.global_min_ is not None else 0.0
+        elif stat == "max":
+            return self.global_max_ if self.global_max_ is not None else 1.0
+        return 0.0
+
+    def fit_transform(self, df, y, fold_indices):
+        # Compute globals
+        self.global_mean_ = float(y.mean())
+        self.global_std_ = float(y.std()) if len(y) > 1 else 0.0
+        self.global_count_ = float(len(y))
+        self.global_min_ = float(y.min())
+        self.global_max_ = float(y.max())
+
+        # Initialize result arrays
+        results = {stat: pd.Series(np.nan, index=df.index, dtype=float) for stat in self.stats}
+
+        # OOF computation
+        for tr_idx, va_idx in fold_indices:
+            tr_col = df[self.col].iloc[tr_idx]
+            tr_y = y.iloc[tr_idx]
+
+            fold_stats = self._compute_fold_stats(tr_col, tr_y)
+
+            for stat in self.stats:
+                if stat in fold_stats:
+                    results[stat].iloc[va_idx] = (
+                        df[self.col].iloc[va_idx].map(fold_stats[stat])
+                    )
+
+        # Fill NaN with neutral defaults
+        for stat in self.stats:
+            fill_val = self._get_fill_value(stat)
+            results[stat] = results[stat].fillna(fill_val)
+
+        # Compute full-data mappings for transform
+        self.mappings_ = self._compute_fold_stats(df[self.col], y)
+
+        # Build output DataFrame
+        out = {}
+        for stat in self.stats:
+            out[self._col_name(stat)] = results[stat].values
+
+        return pd.DataFrame(out, index=df.index)
+
+    def transform(self, df):
+        out = {}
+        for stat in self.stats:
+            fill_val = self._get_fill_value(stat)
+            if self.mappings_ is not None and stat in self.mappings_:
+                vals = df[self.col].map(self.mappings_[stat]).fillna(fill_val)
+            else:
+                vals = pd.Series(fill_val, index=df.index, dtype=float)
+            out[self._col_name(stat)] = vals.values
+
+        return pd.DataFrame(out, index=df.index)
+
+
+# ============================================================================
+# ARITHMETIC INTERACTION EXTENDED (ALL NUMERIC COLUMNS)
+# ============================================================================
+class ArithmeticInteractionExtended(FeatureGenerator):
+    """Sum, difference, product, or ratio between two columns including ordinal integers.
+
+    Identical logic to ``ArithmeticInteraction`` but named distinctly so that
+    the pipeline can apply it to the full set of numeric columns — including
+    ordinal integer columns that may be excluded from the standard arithmetic
+    interaction sweep.
+
+    Parameters
+    ----------
+    col_a : str
+        First column (numeric or ordinal integer).
+    col_b : str
+        Second column (numeric or ordinal integer).
+    op : str
+        Operation: ``'add'``, ``'sub'``, ``'mul'``, or ``'div'``.
+    """
+
+    def __init__(self, col_a: str, col_b: str, op: str = "add"):
+        super().__init__(f"arithext__{col_a}_{op}_{col_b}")
+        self.col_a = col_a
+        self.col_b = col_b
+        self.op = op
+
+    def _compute(self, df):
+        a = df[self.col_a].fillna(0).astype(float)
+        b = df[self.col_b].fillna(0).astype(float)
+        if self.op == "add":
+            return a + b
+        elif self.op == "sub":
+            return a - b
+        elif self.op == "mul":
+            return a * b
+        elif self.op == "div":
+            return a / (b + 1e-8)
+        return a + b
+
+    def fit_transform(self, df, y, fold_indices):
+        vals = self._compute(df)
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+    def transform(self, df):
+        vals = self._compute(df)
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+
+# ============================================================================
+# PAIR PRODUCT FEATURE (NaN-PROPAGATING)
+# ============================================================================
+class PairProductFeature(FeatureGenerator):
+    """Raw arithmetic product of two columns with NaN propagation.
+
+    Unlike ``PolynomialFeature(poly_type='cross')`` which fills NaN with 0
+    before multiplying, this generator propagates NaN so that downstream
+    imputation can handle missing values appropriately. It also accepts any
+    two column names regardless of whether they are purely continuous or
+    ordinal-encoded integers.
+
+    Parameters
+    ----------
+    col_a : str
+        First column (numeric or ordinal integer).
+    col_b : str
+        Second column (numeric or ordinal integer).
+    """
+
+    def __init__(self, col_a: str, col_b: str):
+        super().__init__(f"prod__{col_a}_x_{col_b}")
+        self.col_a = col_a
+        self.col_b = col_b
+
+    def _compute(self, df: pd.DataFrame) -> pd.Series:
+        a = df[self.col_a].astype(float)
+        b = df[self.col_b].astype(float)
+        return a * b
+
+    def fit_transform(self, df, y, fold_indices):
+        vals = self._compute(df)
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
+
+    def transform(self, df):
+        vals = self._compute(df)
+        return pd.DataFrame({self.name: vals.values}, index=df.index)
