@@ -66,6 +66,10 @@ class AutoFE:
     report_path : str, optional
         File path for the feature selection report. Defaults to
         ``'autofepg_report.txt'``.
+    original_df : pd.DataFrame, optional
+        Original (real-world) dataset for domain alignment and Bayesian priors.
+    original_target : pd.Series, optional
+        Target from the original dataset for Bayesian prior computation.
 
     Attributes
     ----------
@@ -104,6 +108,8 @@ class AutoFE:
         sample: Optional[int] = None,
         backward_selection: bool = False,
         report_path: Optional[str] = None,
+        original_df: Optional[pd.DataFrame] = None,
+        original_target: Optional[pd.Series] = None,
     ):
         self.task = task
         self.n_folds = n_folds
@@ -122,6 +128,8 @@ class AutoFE:
         self.sample = sample
         self.backward_selection = backward_selection
         self.report_path = report_path or "autofepg_report.txt"
+        self.original_df = original_df
+        self.original_target = original_target
 
         self.selected_generators_: List[FeatureGenerator] = []
         self.base_score_: Optional[float] = None
@@ -177,6 +185,8 @@ class AutoFE:
         lines.append(f"Backward select.  : {self.backward_selection}")
         if self.sample is not None:
             lines.append(f"Eval sample size  : {self.sample}")
+        lines.append(f"Original data     : {'Yes' if self.original_df is not None else 'No'}")
+        lines.append(f"Original target   : {'Yes' if self.original_target is not None else 'No'}")
         lines.append(f"Total time        : {elapsed_total:.1f}s")
         lines.append("")
 
@@ -564,6 +574,9 @@ class AutoFE:
             max_digit_interaction_order=self.max_digit_interaction_order,
             rounding_decimals=self.rounding_decimals,
             quantile_bins=self.quantile_bins,
+            original_df=self.original_df,
+            original_target=self.original_target,
+            test_df=X_test,
         )
         candidates = builder.build(X_train, y)
 
@@ -787,8 +800,6 @@ class AutoFE:
 # ============================================================================
 # CONVENIENCE FUNCTION
 # ============================================================================
-
-
 def select_features(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -810,6 +821,8 @@ def select_features(
     sample: Optional[int] = None,
     backward_selection: bool = False,
     report_path: Optional[str] = None,
+    original_df: Optional[pd.DataFrame] = None,
+    original_target: Optional[pd.Series] = None,
 ) -> Dict[str, Any]:
     """One-liner convenience function for automatic feature engineering.
 
@@ -855,6 +868,10 @@ def select_features(
         Run backward feature selection after forward selection.
     report_path : str, optional
         Path for the feature selection report file.
+    original_df : pd.DataFrame, optional
+        Original (real-world) dataset for domain alignment and Bayesian priors.
+    original_target : pd.Series, optional
+        Target from the original dataset for Bayesian prior computation.
 
     Returns
     -------
@@ -879,6 +896,8 @@ def select_features(
         sample=sample,
         backward_selection=backward_selection,
         report_path=report_path,
+        original_df=original_df,
+        original_target=original_target,
     )
 
     result = autofe.fit_select(
