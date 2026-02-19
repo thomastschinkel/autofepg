@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 from autofepg.generators import (
     ArithmeticInteraction,
+    ArithmeticInteractionExtended,
     BayesianPriorFeature,
     CountEncoding,
     CountEncodingOnDigit,
@@ -22,13 +23,16 @@ from autofepg.generators import (
     DigitInteraction,
     DomainAlignmentFeature,
     DualRepresentationFeature,
+    ExternalTargetStatFeature,
     FeatureGenerator,
     FrequencyEncoding,
     GroupDeviationFeature,
     GroupStatFeature,
     MissingIndicator,
     NumToCat,
+    OOFTargetAggFeature,
     PairInteraction,
+    PairProductFeature,
     PolynomialFeature,
     QuantileBinFeature,
     RoundFeature,
@@ -49,7 +53,9 @@ class FeatureCandidateBuilder:
 
     1.  Domain Alignment (de-noising) — snap to real-data grid
     2.  Bayesian-Style Priors — external target probability hints
+    2b. External Target Statistics — full distributional shape from original data
     3.  Target Encoding (single columns)
+    3b. OOF Target Aggregation — multi-statistic OOF target encoding
     4.  Count Encoding (single columns)
     5.  Dimensionality Expansion — dual continuous+categorical representation
     6.  Target Encoding on pairs
@@ -59,8 +65,10 @@ class FeatureCandidateBuilder:
     10. Missing Indicators
     11. TE with auxiliary targets
     12. Unary transforms (log, sqrt, square, reciprocal)
-    13. Arithmetic interactions
+    13. Arithmetic interactions (continuous subset)
+    13b. Arithmetic interactions extended (all numeric including ordinal)
     14. Polynomial features
+    14b. Pair product features (NaN-propagating, all numeric)
     15. Pairwise label-encoded interactions
     16. TE/CE on digits
     17. Digit × Cat TE
@@ -198,6 +206,49 @@ class FeatureCandidateBuilder:
         except Exception:
             return None
 
+    def _build_external_stat_map(self, col: str) -> Optional[Dict]:
+        """Compute target distribution statistics per group from the original dataset.
+
+        Returns a dict mapping each value to a sub-dict of statistics:
+        ``{value: {"median": float, "std": float, "skew": float, "count": int}}``.
+        """
+        if self.original_df is None or self.original_target is None:
+            return None
+        if col not in self.original_df.columns:
+            return None
+
+        orig_col = self.original_df[col]
+        orig_y = self.original_target
+
+        if len(orig_col) != len(orig_y):
+            return None
+
+        try:
+            grouped = orig_y.groupby(orig_col)
+            medians = grouped.median()
+            stds = grouped.std().fillna(0.0)
+            counts = grouped.count()
+
+            # Skewness — requires at least 3 observations per group
+            try:
+                skews = grouped.apply(
+                    lambda x: x.skew() if len(x) >= 3 else 0.0
+                )
+            except Exception:
+                skews = pd.Series(0.0, index=medians.index)
+
+            stat_map = {}
+            for val in medians.index:
+                stat_map[val] = {
+                    "median": float(medians.get(val, 0.5)),
+                    "std": float(stds.get(val, 0.0)),
+                    "skew": float(skews.get(val, 0.0)),
+                    "count": float(counts.get(val, 1)),
+                }
+            return stat_map
+        except Exception:
+            return None
+
     def build(self, df: pd.DataFrame, y: pd.Series) -> List[FeatureGenerator]:
         """Build the complete list of feature generator candidates.
 
@@ -247,6 +298,7 @@ class FeatureCandidateBuilder:
             )
         if has_original_target:
             print("[AutoFE-PG] Original target provided — Bayesian priors enabled")
+            print("[AutoFE-PG] External target statistics enabled")
         if has_ecosystem:
             print("[AutoFE-PG] Cross-dataset frequency/density analysis enabled")
 
@@ -276,10 +328,25 @@ class FeatureCandidateBuilder:
                     candidates.append(BayesianPriorFeature(c, prior_map))
 
         # ----------------------------------------------------------------
+        # 2b) External Target Statistics (full distributional shape)
+        # ----------------------------------------------------------------
+        if has_original_target:
+            for c in all_cols:
+                stat_map = self._build_external_stat_map(c)
+                if stat_map and len(stat_map) > 0:
+                    candidates.append(ExternalTargetStatFeature(c, stat_map))
+
+        # ----------------------------------------------------------------
         # 3) TE of base features
         # ----------------------------------------------------------------
         for c in all_cols:
             candidates.append(TargetEncoding(c))
+
+        # ----------------------------------------------------------------
+        # 3b) OOF Target Aggregation (multi-statistic)
+        # ----------------------------------------------------------------
+        for c in all_cols:
+            candidates.append(OOFTargetAggFeature(c, stats=["mean", "std", "count"]))
 
         # ----------------------------------------------------------------
         # 4) CE of base features
@@ -350,12 +417,37 @@ class FeatureCandidateBuilder:
                 candidates.append(UnaryTransform(c, ttype))
 
         # ----------------------------------------------------------------
-        # 13) Arithmetic interactions
+        # 13) Arithmetic interactions (continuous subset)
         # ----------------------------------------------------------------
         num_arith = self.num_cols[: min(len(self.num_cols), 15)]
         for a, b in combinations(num_arith, 2):
             for op in ["add", "sub", "mul", "div"]:
                 candidates.append(ArithmeticInteraction(a, b, op))
+
+        # ----------------------------------------------------------------
+        # 13b) Arithmetic interactions extended (all numeric incl. ordinal)
+        # ----------------------------------------------------------------
+        # Identify ordinal/integer cat cols that were excluded from num_cols
+        ordinal_cats = [
+            c for c in self.cat_cols
+            if df[c].dtype in ["int64", "int32", "int16", "int8"]
+        ]
+        if ordinal_cats:
+            # Interactions between ordinal cats and numeric cols
+            ext_cols = ordinal_cats[: min(len(ordinal_cats), 10)]
+            ext_num = self.num_cols[: min(len(self.num_cols), 10)]
+            for a in ext_cols:
+                for b in ext_num:
+                    for op in ["add", "sub", "mul", "div"]:
+                        candidates.append(
+                            ArithmeticInteractionExtended(a, b, op)
+                        )
+            # Interactions among ordinal cats themselves
+            for a, b in combinations(ext_cols, 2):
+                for op in ["add", "sub", "mul", "div"]:
+                    candidates.append(
+                        ArithmeticInteractionExtended(a, b, op)
+                    )
 
         # ----------------------------------------------------------------
         # 14) Polynomial features
@@ -365,6 +457,17 @@ class FeatureCandidateBuilder:
             candidates.append(PolynomialFeature(c, poly_type="square"))
         for a, b in combinations(num_poly, 2):
             candidates.append(PolynomialFeature(a, b, poly_type="cross"))
+
+        # ----------------------------------------------------------------
+        # 14b) Pair product features (NaN-propagating, all numeric + ordinal)
+        # ----------------------------------------------------------------
+        all_numeric_like = self.num_cols + ordinal_cats if ordinal_cats else self.num_cols
+        prod_cols = all_numeric_like[: min(len(all_numeric_like), 20)]
+        for a, b in combinations(prod_cols, 2):
+            # Skip pairs already covered by PolynomialFeature cross
+            if a in num_poly and b in num_poly:
+                continue
+            candidates.append(PairProductFeature(a, b))
 
         # ----------------------------------------------------------------
         # 15) Pairwise label-encoded interactions
