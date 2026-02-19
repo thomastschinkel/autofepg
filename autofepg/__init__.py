@@ -29,6 +29,7 @@ With Original Data (Domain Alignment + Bayesian Priors)
 from autofepg.core import AutoFE, select_features
 from autofepg.generators import (
     ArithmeticInteraction,
+    ArithmeticInteractionExtended,
     BayesianPriorFeature,
     CountEncoding,
     CountEncodingOnDigit,
@@ -39,13 +40,16 @@ from autofepg.generators import (
     DigitInteraction,
     DomainAlignmentFeature,
     DualRepresentationFeature,
+    ExternalTargetStatFeature,
     FeatureGenerator,
     FrequencyEncoding,
     GroupDeviationFeature,
     GroupStatFeature,
     MissingIndicator,
     NumToCat,
+    OOFTargetAggFeature,
     PairInteraction,
+    PairProductFeature,
     PolynomialFeature,
     QuantileBinFeature,
     RoundFeature,
@@ -97,4 +101,9 @@ __all__ = [
     "DualRepresentationFeature",
     "CrossDatasetFrequencyFeature",
     "ValueRarityFeature",
+    # Generators — extended
+    "ExternalTargetStatFeature",
+    "OOFTargetAggFeature",
+    "ArithmeticInteractionExtended",
+    "PairProductFeature",
 ]
